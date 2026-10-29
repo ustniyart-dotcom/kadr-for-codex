@@ -6,6 +6,9 @@ export function dirOf(p: string): string {
   const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
   if (i < 0) return '.'
   if (i === 0) return p.slice(0, 1)
+  // C:\\video.mp4 lives at the drive root. Returning C: means the current
+  // directory ON that drive, which can send fragments/subtitles elsewhere.
+  if (i === 2 && /^[a-z]:/i.test(p)) return p.slice(0, 3)
   return p.slice(0, i)
 }
 

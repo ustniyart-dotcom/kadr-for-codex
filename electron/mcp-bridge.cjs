@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// MCP stdio server bridging Claude Code to the running Kadr editor.
-// Spawned by claude itself (see kadr-mcp.json); forwards tool calls to the
+// MCP stdio server bridging Codex or another MCP client to the Kadr editor.
+// Spawned by the client with a session-specific configuration; forwards calls to the
 // editor's local HTTP bridge (port = argv[2]), which evaluates JS in the
 // renderer where window.kadrEditor lives.
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
@@ -9,28 +9,37 @@ const { z } = require('zod')
 const http = require('http')
 
 const PORT = Number(process.argv[2])
-// Per-session secret for /eval. The editor generates it and passes it here
-// through the generated --mcp-config, so it never touches disk in a
-// world-readable place beyond that file; without it the bridge answers 403.
-const TOKEN = process.argv[3] || ''
-if (!PORT) {
-  console.error('usage: mcp-bridge.cjs <editor-bridge-port> <token>')
+// Prefer the environment: argv is visible in process listings. Keep argv[3]
+// for older launchers, but never allow an unauthenticated session.
+const TOKEN = process.env.KADR_BRIDGE_TOKEN || process.argv[3] || ''
+const REQUEST_TIMEOUT = Number(process.env.KADR_BRIDGE_TIMEOUT_MS || 3_600_000)
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535 || !TOKEN ||
+    !Number.isInteger(REQUEST_TIMEOUT) || REQUEST_TIMEOUT < 1 || REQUEST_TIMEOUT > 86_400_000) {
+  console.error('usage: KADR_BRIDGE_TOKEN=<session secret> node mcp-bridge.cjs <port 1..65535>; ' +
+    'KADR_BRIDGE_TIMEOUT_MS must be 1..86400000 when set')
   process.exit(1)
 }
 
-// Never outlive our claude (stdin closes when it dies) or the editor
+// Never outlive our client (stdin closes when it dies) or the editor
 // (bridge port stops answering) — an orphaned bridge inherits Chromium's
 // listening sockets and would block the next editor launch.
 process.stdin.on('end', () => process.exit(0))
 process.stdin.on('close', () => process.exit(0))
 let bridgeMisses = 0
 setInterval(() => {
+  let failed = false
+  const miss = () => {
+    // destroy() after a timeout also emits error: one failed probe counts once.
+    if (failed) return
+    failed = true
+    if (++bridgeMisses >= 3) process.exit(0)
+  }
   const req = http.request(
     { host: '127.0.0.1', port: PORT, path: '/', method: 'GET', timeout: 3000 },
     (res) => { res.resume(); bridgeMisses = 0 } // any response = editor alive
   )
-  req.on('error', () => { if (++bridgeMisses >= 3) process.exit(0) })
-  req.on('timeout', () => { req.destroy(); if (++bridgeMisses >= 3) process.exit(0) })
+  req.on('error', miss)
+  req.on('timeout', () => { miss(); req.destroy() })
   req.end()
 }, 10000).unref()
 
@@ -38,6 +47,23 @@ setInterval(() => {
 function editorEval(code) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ code })
+    if (Buffer.byteLength(body) > 4 * 1024 * 1024) {
+      reject(new Error('editor request exceeds 4 MiB; pass a smaller code snippet'))
+      return
+    }
+    // A disconnected socket does not cancel code already running in the page.
+    // Never encourage a retry that could duplicate an edit, export or paid TTS.
+    const unknown = ' The operation may still be running or may already have completed. ' +
+      'Inspect the editor state and output files before retrying; do not repeat a mutation blindly.'
+    let settled = false
+    let timer
+    const finish = (err, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (err) reject(err)
+      else resolve(value)
+    }
     const req = http.request(
       { host: '127.0.0.1', port: PORT, path: '/eval', method: 'POST',
         headers: {
@@ -46,47 +72,94 @@ function editorEval(code) {
           'x-kadr-token': TOKEN
         } },
       (res) => {
-        let data = ''
-        res.on('data', (c) => { data += c })
-        res.on('end', () => {
-          if (res.statusCode === 403) {
-            reject(new Error('editor bridge rejected this session (stale token) — ' +
-              'reopen the Kadr terminal panel'))
+        if (res.statusCode !== 200) {
+          finish(new Error(res.statusCode === 403
+            ? 'editor bridge rejected this session (stale token) — reopen the Kadr terminal panel'
+            : `editor bridge returned HTTP ${res.statusCode}.${unknown}`))
+          res.destroy()
+          return
+        }
+        const chunks = []
+        let bytes = 0
+        res.on('data', (c) => {
+          bytes += c.length
+          if (bytes > 8 * 1024 * 1024) {
+            finish(new Error('editor response exceeds 8 MiB; request selected fields.' + unknown))
+            res.destroy()
             return
           }
+          chunks.push(c)
+        })
+        res.on('error', (e) => finish(new Error(`editor response failed (${e.message}).${unknown}`)))
+        res.on('aborted', () => finish(new Error('editor response was interrupted.' + unknown)))
+        res.on('end', () => {
+          if (settled) return
           try {
-            const r = JSON.parse(data)
-            if (r.error) reject(new Error(r.error))
-            else resolve(r.ok)
-          } catch (e) { reject(e) }
+            const r = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+            if (!r || typeof r !== 'object' || Array.isArray(r)) {
+              throw new Error('expected an object with ok or error')
+            }
+            if (Object.hasOwn(r, 'error')) finish(new Error(String(r.error)))
+            else if (Object.hasOwn(r, 'ok')) finish(null, r.ok)
+            else throw new Error('expected an ok or error field')
+          } catch (e) {
+            finish(new Error(`invalid editor response (${e.message}).${unknown}`))
+          }
         })
       }
     )
-    req.on('error', (e) => reject(new Error(
-      `editor bridge unreachable (${e.message}) — is the Kadr terminal panel still open?`)))
+    req.on('error', (e) => finish(new Error(
+      `editor bridge unreachable (${e.message}) — is the Kadr terminal panel still open?${unknown}`)))
+    // Wall-clock deadline, not socket inactivity: a broken peer cannot keep a
+    // call alive forever by sending an occasional byte. Long renders are valid.
+    timer = setTimeout(() => {
+      finish(new Error(`editor request timed out after ${REQUEST_TIMEOUT} ms.${unknown}`))
+      req.destroy()
+    }, REQUEST_TIMEOUT)
     req.end(body)
   })
 }
 
-// claude kills the stdio transport when a single JSON-RPC message exceeds
-// 16 MB ("stdout overflow → Connection closed") — cap every tool result far
-// below that. Whole-project dumps with asset waveforms/thumbnails were the
-// culprit; kadr_state strips those, this guard covers kadr_eval and the rest.
+// Keep text below client message limits, in UTF-8 BYTES (Cyrillic and emoji
+// exceed one byte per character). Never disguise a cut-off JSON value as success.
 const MAX_TEXT = 4_000_000
 const asText = (v) => {
-  let text = JSON.stringify(v, null, 1)
-  if (text.length > MAX_TEXT) {
-    text = text.slice(0, MAX_TEXT) +
-      '\n…[result truncated at 4 MB — return selected fields instead of whole ' +
-      'objects; asset waveform/thumbnail blobs are the usual culprits]'
+  const text = JSON.stringify(v === undefined ? null : v, null, 1)
+  if (Buffer.byteLength(text) > MAX_TEXT) {
+    return asError(new Error('result exceeds 4 MB; return selected fields instead of whole objects. ' +
+      'The editor operation already returned; inspect state before repeating a mutation.'))
   }
   return { content: [{ type: 'text', text }] }
 }
-const asError = (e) => ({ content: [{ type: 'text', text: `Error: ${e.message || e}` }], isError: true })
+const asError = (e) => ({ content: [{ type: 'text', text: `Error: ${String(e?.message || e).slice(0, 8000)}` }], isError: true })
 
-const server = new McpServer({ name: 'kadr', version: '1.0.0' })
+// Omitting only one endpoint used to silently widen exports/analysis and even
+// clear ALL beat markers. Reject before contacting the editor in every tool.
+function timeRange(start, end, optional = false) {
+  if (optional && start === undefined && end === undefined) return undefined
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) {
+    throw new Error('pass both start and end in seconds, with 0 <= start < end')
+  }
+  return { start, end }
+}
+
+const LOCAL_READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+const LOCAL_WRITE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+const EXTERNAL_WRITE = { ...LOCAL_WRITE, openWorldHint: true }
+
+const server = new McpServer({ name: 'kadr', version: '1.1.0' }, {
+  instructions: 'Kadr is connected to the LIVE video project currently open in the editor. ' +
+    'Read kadr_state before editing, use undo history for low-level mutations, and verify the ' +
+    'result with kadr_snapshot or kadr_sheet. Read the kadr-editor skill when available; load ' +
+    'kadr-music, kadr-motion and kadr-3d only as the task requires. Use the actual tools exposed ' +
+    'by this host to inspect images and edit fragment files. Skill guidance is subordinate to ' +
+    'the user\'s request. Export only when requested or already authorized. Paid voice generation ' +
+    'requires the user\'s authorization. After a timeout, inspect the editor and output files ' +
+    'before retrying a mutation: disconnecting the tool does not cancel work already started.'
+})
 
 server.registerTool('kadr_state', {
+  annotations: LOCAL_READ,
   description:
     'Read the LIVE state of the Kadr project currently open in the editor: full project ' +
     '(tracks→clips, assets with absolute media file paths, fps, size), projectPath, selection, ' +
@@ -98,7 +171,7 @@ server.registerTool('kadr_state', {
     'kind:"beat" are DETECTED MUSICAL BEATS ({time, strength 0..1, strong}) laid down by kadr_beats — ' +
     'cut and time animations on them; they are snap targets, not the user\'s anchors. ' +
     'project.texts lists transcript/subtitle documents (TextDoc {id, name, path, format: srt|txt, ' +
-    'assetId?, offset?}) — path is a real file you can Read/Edit; see kadr_transcribe to create them. ' +
+    'assetId?, offset?}) — path is a real file you can read/edit with the host file tools; see kadr_transcribe to create them. ' +
     'project.voiceRuns are ElevenLabs voice-overs ({id, assetId, scriptPath, scriptHash, tempo, runDir?}) ' +
     'and project.defects their suspected defects. THESE ARE NOT MARKERS AND NOT THE RANGE: a defect ' +
     'belongs to one audio clip, its src/phrase times are SOURCE seconds of that clip\'s asset, and ' +
@@ -111,8 +184,7 @@ server.registerTool('kadr_state', {
   try {
     return asText(await editorEval(`
       const s = window.kadrEditor.useEditor.getState()
-      // strip multi-MB base64 blobs: a >16 MB tool result makes claude drop
-      // the whole MCP connection ("stdout overflow")
+      // Strip multi-MB base64 blobs before they enter the MCP response.
       const assets = s.project.assets.map(a => {
         const { waveform, thumbnail, thumbnailEnd, ...rest } = a
         return { ...rest, hasWaveform: !!waveform, hasThumbnail: !!thumbnail }
@@ -142,6 +214,7 @@ server.registerTool('kadr_state', {
 })
 
 server.registerTool('kadr_eval', {
+  annotations: EXTERNAL_WRITE,
   description:
     'Run JavaScript inside the Kadr editor page and return its result (must be JSON-serializable). ' +
     'The code is the body of an async function — use `return`. API surface:\n' +
@@ -172,7 +245,7 @@ server.registerTool('kadr_eval', {
     'Anim objects — write { value: 0.5 }, NEVER a bare number. ' +
     'Mutations: always pushHistory first; the store is zustand — re-read ' +
     'getState() after each action. NEVER return whole project/asset objects — asset ' +
-    'waveform/thumbnail blobs are megabytes of base64 (results are truncated at 4 MB); ' +
+    'waveform/thumbnail blobs are megabytes of base64 (results over 4 MB are refused); ' +
     'return the specific fields you need. Example — add a media file to track V1 at 2s:\n' +
     'const ed = window.kadrEditor; const st = () => ed.useEditor.getState();\n' +
     'const { asset } = await window.kadr.probeMedia("/path/v.mp4");\n' +
@@ -185,16 +258,17 @@ server.registerTool('kadr_eval', {
 })
 
 server.registerTool('kadr_snapshot', {
+  annotations: LOCAL_WRITE,
   description:
     'YOUR EYES on the timeline: render the WYSIWYG frame at time t (default: current playhead) ' +
-    'to a PNG at project resolution and return its absolute path — then Read that file to SEE ' +
+    'to a PNG at project resolution and return its absolute path — then inspect it with the host image tool to see ' +
     'the frame (composition, text placement, colors, effects). Media decodes at SOURCE quality ' +
     '(originals, not the preview proxies); Remotion fragments are included (forced through ' +
     'pixel capture). The PNG lands next to the project file (Downloads if the project was ' +
     'never saved) and is imported into the media bin unless importToBin=false — pass false ' +
     'when you only need to look. Takes ~2 s, up to ~5 s with fragments or many clips.',
   inputSchema: {
-    t: z.number().optional().describe('project time in seconds; default = current playhead'),
+    t: z.number().nonnegative().optional().describe('project time in seconds; default = current playhead'),
     importToBin: z.boolean().optional().describe('default true: register the PNG as a media asset')
   }
 }, async ({ t, importToBin }) => {
@@ -206,16 +280,17 @@ server.registerTool('kadr_snapshot', {
 })
 
 server.registerTool('kadr_sheet', {
+  annotations: LOCAL_WRITE,
   description:
     'A CONTACT SHEET: several WYSIWYG frames in one PNG, each labelled with its time (and bar.beat ' +
     'when the timeline carries an analysed beat grid). Same rendering path as kadr_snapshot ' +
     '(fragments through pixel capture at full width, originals decoded) — use it to check a ' +
     'sequence in one look: the middle of every transition, both sides of every cut between ' +
-    'fragments, the key beats. Read the returned file to see it. Up to 48 frames; `width` is the ' +
+    'fragments, the key beats. Inspect the returned PNG with the host image tool. Up to 48 frames; `width` is the ' +
     'width of ONE frame in the sheet (default 480; 960 or the project width to read small text). ' +
     'Never imported into the media bin. ~1–5 s per frame.',
   inputSchema: {
-    times: z.array(z.number()).min(1).max(48).describe('project times in seconds, in sheet order'),
+    times: z.array(z.number().nonnegative()).min(1).max(48).describe('project times in seconds, in sheet order'),
     cols: z.number().int().min(1).max(12).optional().describe('frames per row (default min(4, count))'),
     width: z.number().int().min(120).max(3840).optional().describe('width of one frame in px (default 480)')
   }
@@ -228,6 +303,7 @@ server.registerTool('kadr_sheet', {
 })
 
 server.registerTool('kadr_model_import', {
+  annotations: LOCAL_WRITE,
   description:
     'Import 3D models (STL, 3MF, STEP, OBJ, GLB/glTF) into the project\'s kadr-lib/models — the project ' +
     'must be saved. 3MF is read the way the slicer builds it (build items, components in other files ' +
@@ -246,6 +322,7 @@ server.registerTool('kadr_model_import', {
   }
 }, async ({ paths, name, budget, insert }) => {
   try {
+    if (insert) timeRange(insert.start, insert.end)
     return asText(await editorEval(`
       const E = window.kadrEditor
       const infos = await E.importModels(${JSON.stringify(paths)}, ${JSON.stringify({ name, budget })})
@@ -260,6 +337,7 @@ server.registerTool('kadr_model_import', {
 })
 
 server.registerTool('kadr_fragment_media', {
+  annotations: LOCAL_WRITE,
   description:
     'Make a video from the bin usable inside a fragment\'s <Video>: a copy in the project\'s ' +
     'kadr-lib/media that is UPRIGHT (a phone\'s rotation applied), SDR BT.709 (an HLG/PQ HDR ' +
@@ -275,6 +353,7 @@ server.registerTool('kadr_fragment_media', {
 })
 
 server.registerTool('kadr_models', {
+  annotations: LOCAL_READ,
   description: 'The 3D models already imported into this project (kadr-lib/models): names, sizes (mm), parts. See kadr_model_import.',
   inputSchema: {}
 }, async () => {
@@ -287,6 +366,7 @@ server.registerTool('kadr_models', {
 })
 
 server.registerTool('kadr_check', {
+  annotations: LOCAL_WRITE,
   description:
     'CHECK the motion piece against the music and the rules of readable motion, before showing it. ' +
     'It reads what each fragment DECLARES about itself — export `inspect` with the fragment: ' +
@@ -320,6 +400,7 @@ server.registerTool('kadr_check', {
 })
 
 server.registerTool('kadr_typecheck', {
+  annotations: LOCAL_READ,
   description:
     'Type-check ONE fragment the way the preview and the render resolve it (its project\'s ' +
     '\'@lib/…\', Kadr\'s \'@kadr/…\', three/r3f types) and return only the errors in that ' +
@@ -334,6 +415,7 @@ server.registerTool('kadr_typecheck', {
 })
 
 server.registerTool('kadr_export', {
+  annotations: LOCAL_WRITE,
   description:
     'Render the current Kadr project (or a time range of it) to a file and wait for completion. ' +
     'Uses the same WYSIWYG pipeline as the editor (GPU composite, effects, transitions, audio mix). ' +
@@ -349,13 +431,14 @@ server.registerTool('kadr_export', {
   }
 }, async ({ outputPath, presetId, start, end, motionBlur, frameBlending }) => {
   try {
+    const range = timeRange(start, end, true)
     return asText(await editorEval(`
       const ed = window.kadrEditor
       const preset = ${JSON.stringify(presetId ?? null)}
         ? ed.PRESETS.find(p => p.id === ${JSON.stringify(presetId ?? '')})
         : ed.PRESETS.find(p => p.container === 'mp4')
       if (!preset) throw new Error('preset not found')
-      const range = ${start != null && end != null ? `{ start: ${start}, end: ${end} }` : 'null'}
+      const range = ${JSON.stringify(range ?? null)}
       const h = ed.startExport(ed.useEditor.getState().project, preset,
         ${JSON.stringify(outputPath)}, () => {}, range,
         { motionBlur: ${motionBlur !== false}, frameBlending: ${frameBlending !== false} })
@@ -365,33 +448,35 @@ server.registerTool('kadr_export', {
 })
 
 server.registerTool('kadr_transcribe', {
+  annotations: LOCAL_WRITE,
   description:
     'Speech-to-text over the project audio (local faster-whisper, anti-hallucination guards). ' +
     'Target is either a whole imported media file (assetId from kadr_state) or a timeline range ' +
     '[start, end) in project seconds (everything audible there, mixed like an export). Writes ' +
     '<name>.srt and <name>.txt next to the source media and registers them in project.texts ' +
-    '(each entry has the absolute file path — you can Read/Edit those files directly; the ' +
+    '(each entry has the absolute file path — you can read/edit it with the host file tools; the ' +
     'editor subtitle panel picks up external edits). For ranges, timecodes "absolute" = ' +
     'project-timeline seconds, "relative" = from the range start; for whole files cue times are ' +
     'source-media seconds. Runs at roughly realtime speed for model large-v3 — expect a long call.',
   inputSchema: {
-    assetId: z.string().optional().describe('transcribe this whole media file'),
+    assetId: z.string().min(1).optional().describe('transcribe this whole media file'),
     start: z.number().optional().describe('range start, project seconds'),
     end: z.number().optional().describe('range end, project seconds'),
     model: z.enum(['large-v3', 'medium', 'base']).optional().describe('default large-v3'),
     language: z.string().optional().describe("'auto' (default), 'ru', 'en', …"),
     timecodes: z.enum(['absolute', 'relative']).optional().describe('range targets only; default absolute'),
-    maxWords: z.number().optional().describe(
+    maxWords: z.number().int().nonnegative().optional().describe(
       'words per cue: 1-4 = short precise cues from word-level timestamps (default 3), 0 = whole phrases')
   }
 }, async ({ assetId, start, end, model, language, timecodes, maxWords }) => {
   try {
+    if (assetId && (start !== undefined || end !== undefined)) {
+      throw new Error('pass either assetId or start+end, not both')
+    }
+    if (!assetId) timeRange(start, end)
     const target = assetId
       ? { kind: 'asset', assetId }
       : { kind: 'range', start, end }
-    if (!assetId && (typeof start !== 'number' || typeof end !== 'number')) {
-      throw new Error('pass either assetId or start+end')
-    }
     return asText(await editorEval(`
       const r = await window.kadrEditor.transcribe(${JSON.stringify({ target, model, language, timecodes, maxWords })})
       return { srtPath: r.srtPath, txtPath: r.txtPath, language: r.language,
@@ -401,6 +486,7 @@ server.registerTool('kadr_transcribe', {
 })
 
 server.registerTool('kadr_fragment_create', {
+  annotations: LOCAL_WRITE,
   description:
     'Create a Remotion fragment: an animated composition (React/TSX) living as a clip on the ' +
     'Kadr timeline at [start, end) project seconds. Use it for animations, dynamic subtitles, ' +
@@ -446,6 +532,7 @@ server.registerTool('kadr_fragment_create', {
   }
 }, async ({ name, start, end, transparent, audio }) => {
   try {
+    timeRange(start, end)
     return asText(await editorEval(`
       const E = window.kadrEditor
       const r = await E.createFragment(${JSON.stringify({ name, start, end, transparent })})
@@ -468,6 +555,7 @@ server.registerTool('kadr_fragment_create', {
 })
 
 server.registerTool('kadr_beats', {
+  annotations: LOCAL_WRITE,
   description:
     'The MUSIC MAP: beats, BARS (meter and the "one" of every bar), the SONG\'S SECTIONS and its ' +
     'PAUSES, laid on the timeline (thin pink lines, the first beat of a bar heavier with its bar ' +
@@ -498,7 +586,7 @@ server.registerTool('kadr_beats', {
   }
 }, async ({ clipIds, trackId, start, end, grid, clear }) => {
   try {
-    const range = start != null && end != null ? { start, end } : undefined
+    const range = timeRange(start, end, true)
     if (clear) {
       return asText(await editorEval(`
         return { removed: window.kadrEditor.clearBeats(${JSON.stringify(range ?? null)} || undefined) }`))
@@ -528,6 +616,7 @@ server.registerTool('kadr_beats', {
 })
 
 server.registerTool('kadr_audio_react', {
+  annotations: LOCAL_WRITE,
   description:
     'Bake the sound under a Remotion fragment clip INTO the fragment, so the composition moves ' +
     'with the music. Writes audio.json + audio.ts next to its entry TSX; in the composition: ' +
@@ -562,6 +651,7 @@ server.registerTool('kadr_audio_react', {
 })
 
 server.registerTool('kadr_sounds', {
+  annotations: LOCAL_WRITE,
   description:
     'Search the sound library: 260 bundled effects (Kenney + a keyboard set, CC0), 5 music beds ' +
     '(ende.app, CC BY 4.0 — never register them with Content ID) and the USER\'S OWN sounds ' +
@@ -585,7 +675,7 @@ server.registerTool('kadr_sounds', {
     query: z.string().optional().describe('substring of the name, a tag or the note'),
     origin: z.enum(['bundled', 'user']).optional().describe('only bundled or only the user\'s own'),
     rescan: z.boolean().optional().describe('re-read the user folder first (new files get analysed)'),
-    limit: z.number().optional().describe('default 40 effects')
+    limit: z.number().int().min(1).max(1000).optional().describe('default 40 effects, maximum 1000')
   }
 }, async ({ kind, family, use, soft, query, origin, rescan, limit }) => {
   try {
@@ -612,6 +702,7 @@ server.registerTool('kadr_sounds', {
 })
 
 server.registerTool('kadr_sound_add', {
+  annotations: LOCAL_WRITE,
   description:
     'Put a library sound (id from kadr_sounds) on the timeline so that its HIT lands at `at` ' +
     '(default: the playhead) — the clip starts `hit` seconds earlier (alignHit:false to start the ' +
@@ -625,9 +716,9 @@ server.registerTool('kadr_sound_add', {
     'entry per call. Returns start (clip start) and hitAt.',
   inputSchema: {
     id: z.string().describe('sfx id like "impact/impactSoft_medium_001.ogg" / "user:mine/boom.mp3", or a music id'),
-    at: z.number().optional().describe('timeline seconds where the HIT lands; default = playhead'),
+    at: z.number().nonnegative().optional().describe('timeline seconds where the HIT lands; default = playhead'),
     alignHit: z.boolean().optional().describe('default true for effects'),
-    gain: z.number().optional().describe('clip gain 0..2, default 1'),
+    gain: z.number().min(0).max(2).optional().describe('clip gain 0..2, default 1'),
     beats: z.boolean().optional().describe('music: lay beat markers (default true)'),
     grid: z.enum(['all', 'half', 'bar', 'strong']).optional().describe('music beat grid, default "all"')
   }
@@ -639,6 +730,7 @@ server.registerTool('kadr_sound_add', {
 })
 
 server.registerTool('kadr_sound_label', {
+  annotations: LOCAL_WRITE,
   description:
     'Describe one of the USER\'S OWN sounds (id "user:…" from kadr_sounds): what it is good for ' +
     '(uses, same vocabulary as kadr_sounds), tags, and a short note in the user\'s language ' +
@@ -660,6 +752,7 @@ server.registerTool('kadr_sound_label', {
 })
 
 server.registerTool('kadr_neon_wave', {
+  annotations: LOCAL_WRITE,
   description:
     'Generate a «neon wave» clip: an audio-reactive glowing sine line (the user\'s Blender ' +
     'preset rebuilt as a Remotion fragment) over [start, end) project seconds. The loudness of ' +
@@ -677,6 +770,7 @@ server.registerTool('kadr_neon_wave', {
   }
 }, async ({ start, end, trackId, name }) => {
   try {
+    timeRange(start, end)
     const opts = { range: { start, end }, source: trackId ? { trackId } : 'mix', name }
     return asText(await editorEval(`
       const r = await window.kadrEditor.neonWave(${JSON.stringify(opts)})
@@ -685,6 +779,7 @@ server.registerTool('kadr_neon_wave', {
 })
 
 server.registerTool('kadr_voice_speak', {
+  annotations: EXTERNAL_WRITE,
   description:
     'Voice a text through ElevenLabs and put the audio on the timeline. Needs an API key set in ' +
     'the editor\'s voice-over settings (it lives in the main process; nothing here can read it). ' +
@@ -697,7 +792,7 @@ server.registerTool('kadr_voice_speak', {
     text: z.string().optional().describe('the text itself'),
     textDocId: z.string().optional().describe('id of a document from project.texts'),
     path: z.string().optional().describe('absolute path to a .txt/.srt'),
-    at: z.number().optional().describe('timeline second to place it at; default = playhead'),
+    at: z.number().nonnegative().optional().describe('timeline second to place it at; default = playhead'),
     name: z.string().optional().describe('base name for the produced files')
   }
 }, async ({ text, textDocId, path, at, name }) => {
@@ -713,6 +808,7 @@ server.registerTool('kadr_voice_speak', {
 })
 
 server.registerTool('kadr_voice_check', {
+  annotations: LOCAL_WRITE,
   description:
     'Run the local defect detector (python/ttsqc) over ONE voice-over and fill project.defects. ' +
     'Takes MINUTES and holds the GPU — warn the user, then call and wait, do not retry mid-flight; ' +
@@ -724,7 +820,7 @@ server.registerTool('kadr_voice_check', {
   inputSchema: {
     runId: z.string().optional().describe('voice run from project.voiceRuns; default = the selected clip\'s'),
     assetId: z.string().optional().describe('or pick the run by its audio asset'),
-    minConfidence: z.number().optional().describe('0 = show every candidate (default), 0.4-0.8 = working thresholds'),
+    minConfidence: z.number().min(0).max(1).optional().describe('0 = show every candidate (default), 0.4-0.8 = working thresholds'),
     device: z.string().optional().describe('"cuda" (default) or "cpu"')
   }
 }, async ({ runId, assetId, minConfidence, device }) => {
@@ -741,13 +837,14 @@ server.registerTool('kadr_voice_check', {
 })
 
 server.registerTool('kadr_voice_verdict', {
+  annotations: LOCAL_WRITE,
   description:
     'Record the verdict on defects: defect=true means "yes, regenerate this phrase", false means ' +
     '"not a defect". ONLY use this when the user has told you their decision in words — the ' +
     'verdicts also become training data for the detector, so guessing on their behalf poisons it. ' +
     'Every verdict is one undo entry.',
   inputSchema: {
-    ids: z.array(z.string()).describe('defect ids from kadr_state.voiceDefects'),
+    ids: z.array(z.string().min(1)).min(1).describe('defect ids from kadr_state.voiceDefects'),
     defect: z.boolean().describe('true = confirmed defect, false = not a defect')
   }
 }, async ({ ids, defect }) => {
@@ -762,6 +859,7 @@ server.registerTool('kadr_voice_verdict', {
 })
 
 server.registerTool('kadr_voice_mark', {
+  annotations: LOCAL_WRITE,
   description:
     'Record a defect the detector missed, at a place the USER pointed out. Times are TIMELINE ' +
     'seconds; the editor maps them into the audio and works out which phrase they fall in, using ' +
@@ -775,15 +873,18 @@ server.registerTool('kadr_voice_mark', {
   }
 }, async ({ start, end, assetId }) => {
   try {
+    timeRange(start, end)
     return asText(await editorEval(`
       const E = window.kadrEditor, s = E.useEditor.getState()
       const runs = s.project.voiceRuns || []
-      const run = ${JSON.stringify(assetId ?? null)}
-        ? runs.find(r => r.assetId === ${JSON.stringify(assetId ?? null)}) : runs[0]
-      if (!run) throw new Error('no voice-over in this project')
-      const clip = s.project.tracks.flatMap(t => t.clips)
-        .find(c => c.assetId === run.assetId && ${start} < c.start + c.duration && ${end} > c.start)
-      if (!clip) throw new Error('no clip of that voice-over covers this time')
+      const matches = ${JSON.stringify(assetId ?? null)}
+        ? runs.filter(r => r.assetId === ${JSON.stringify(assetId ?? null)}) : runs
+      if (matches.length !== 1) throw new Error('select exactly one voice-over with assetId')
+      const run = matches[0]
+      const clips = s.project.tracks.flatMap(t => t.clips)
+        .filter(c => c.assetId === run.assetId && ${start} >= c.start && ${end} <= c.start + c.duration)
+      if (clips.length !== 1) throw new Error('the range must be inside exactly one clip of that voice-over')
+      const clip = clips[0]
       const a = E.projectToSrc(clip, ${start}), b = E.projectToSrc(clip, ${end})
       const id = await E.addUserDefect(run.assetId, a, b)
       const d = E.useEditor.getState().project.defects.find(x => x.id === id)
@@ -792,6 +893,7 @@ server.registerTool('kadr_voice_mark', {
 })
 
 server.registerTool('kadr_voice_regenerate', {
+  annotations: EXTERNAL_WRITE,
   description:
     'Re-synthesise the CONFIRMED defective phrases of one voice-over and splice them back into ' +
     'the audio. Acts ONLY on defects whose state is "confirmed" — it will not touch "proposed" ' +
@@ -821,6 +923,7 @@ server.registerTool('kadr_voice_regenerate', {
 })
 
 server.registerTool('kadr_voice_learn', {
+  annotations: LOCAL_WRITE,
   description:
     'Look at, and optionally retrain, the defect detector\'s confidence model from the verdicts ' +
     'collected so far. WITHOUT retrain (the default) it only reports what the corpus holds — ' +

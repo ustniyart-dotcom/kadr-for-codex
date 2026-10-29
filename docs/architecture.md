@@ -1,0 +1,684 @@
+# Kadr — GPU-accelerated multi-track video editor
+
+Electron + React + TypeScript. The preview is composited on the GPU
+(WebGL2); export is WYSIWYG: the same compositor renders offline frames
+into WebCodecs H.264, mp4-muxer writes a temp MP4, then the system ffmpeg
+mixes audio and muxes/transcodes per preset.
+
+## Commands
+- `npm run dev` — launch in dev mode (Electron needs a display)
+- `npm run build` — production build into `out/`
+- `npm run typecheck` — both renderer (`tsconfig.web.json`) and main
+  (`tsconfig.node.json`)
+- `node scripts/e2eNN.mjs` — CDP smoke tests; first start the app with
+  `npx electron-vite dev -- --remote-debugging-port=9777`; generate the
+  test media with `scripts/gen-test-media.sh` (the older suites need it;
+  newer suites create their own files in `/tmp/kadr-test`). The voice-over
+  suites need `KADR_TTS_MOCK=1` in the app's environment, or they would
+  spend real API credits.
+- Pure node checks — no app, no network:
+  `node scripts/check-envelope.mjs` (loudness envelope),
+  `check-ttstext.mjs` (text splitting), `check-proxy.mjs` (proxy choice),
+  `check-voicemap.mjs` (time remapping after a splice),
+  `check-beats.mjs [resources/music]` (beat analysis; with the folder it is
+  compared beat for beat with librosa's own cues), and with ffmpeg
+  `check-limiter.mjs` (the export master limiter) and
+  `check-sfx-labels.mjs` (sound labels vs /brag's 228) and `check-hdr.mjs`
+  (the HDR → SDR maths and ffmpeg's own filter chain against the formula);
+  `check-models.mjs` (3MF build items/components/units, STL, OBJ, GLB,
+  decimation) and `check-timeline.mjs` (the timeline's waveform columns and
+  overlap zones must EQUAL the slow code they replaced); plus
+  `<python3.11> scripts/check-phrases.py` for the phrase-boundary maths.
+  `node scripts/gen-sfx-catalog.mjs` regenerates
+  `resources/sfx/kadr-sfx.json` after a bundled sound or
+  `SFX_ANALYSIS_VERSION` changes.
+- e2e44 (beats, audio-reactive bake, sound library), e2e45 (fragment
+  preview stacking, hot reload of a late project-owned fragment), e2e46
+  (preview at cuts, snapshots of heavy 3D), e2e47 (project library, fonts,
+  render entry, typecheck), e2e48 (checks), e2e49 (3D import, kit,
+  collisions), e2e50 (fragment parameters, onion skin), e2e51 (bounded
+  preview pool, timeline culling, zoom gestures) and e2e52 (partial
+  fragment renders, every output frame checked by pixels; the export
+  decoder's first frame and backward jumps) replace the open project,
+  so they REFUSE to run over one with clips unless `KADR_E2E_FORCE=1`.
+- `node scripts/preview-bench.mjs <from> <to>` — plays a span of the open
+  project and reports editor frames, draws per fragment iframe, iframe
+  processes and the worst frame at every fragment cut. Plays sound.
+- `node scripts/gen-icons.mjs [dir]` — regenerate `src/components/icons.tsx`
+  from lucide (see the header for the two-line fetch); never hand-edit the
+  paths.
+- `node scripts/hold-viewport.mjs [w] [h]` — force the page's layout
+  viewport while coordinate-driven suites run (a tiling window manager can
+  pin the editor window at a size those suites do not expect).
+
+## Requirements
+- Node.js ≥ 22.12, system `ffmpeg`/`ffprobe` in PATH
+- Optional: `python3` + `faster-whisper` (speech-to-text), the `codex`
+  CLI (embedded AI assistant), network access for the one-time Remotion
+  workspace install
+- Optional for voice-over: an ElevenLabs API key (entered in the app,
+  stored outside the project); for the defect detector, python ≥ 3.11
+  with `torch` — the interpreter is a setting (`KADR_TTSQC_PYTHON`), and
+  the module degrades to plain voice-over when it is missing
+
+## Architecture
+- `shared/types.ts` — the entire project model (Project/Track/Clip/Anim/
+  Keyframe, TextDoc, FragmentSpec, ExportPreset/ExportJob, the `KadrApi`
+  IPC surface). All times in seconds. `Anim` is a scalar that may carry
+  keyframes; `evalAnim` interpolates. `tracks[0]` is the top video track
+  (drawn last).
+- `electron/main.ts` — window, `kadr://` streaming protocol with manual
+  Range support, IPC: dialogs, project IO (incl. atomic autosave), export,
+  user stores, proxy queue, reversed-media cache, media intake
+  (`media:download` — browser-URL drops fetched into `userData/imported`,
+  cached by URL hash; `media:save-blob` — path-less Files / data: URLs /
+  clipboard images, cached by content hash; `media:portal-files` — XDG
+  FileTransfer portal drops resolved over the session bus via gdbus;
+  `media:clipboard-paste` — copied files or a copied image). A malformed
+  `DBUS_SESSION_BUS_ADDRESS` in the launching environment silently breaks
+  portal drops — main normalizes it to the live user socket at startup.
+  The scheme MUST stay registered with `corsEnabled: true` (+ ACAO:*
+  responses and `crossOrigin='anonymous'` on media elements incl. Image)
+  — modern Chromium otherwise taints kadr:// pixels and preview/export go
+  black. Those same privileges (plus `bypassCSP`) make the scheme a
+  file-read capability, so every URL carries a per-run token: `fileUrl` in
+  the preload appends `?t=<48 hex>` (fetched once over a sync `media:token`
+  IPC) and the handler 403s anything else. Without it a page served by the
+  FRAGMENT dev server — another origin, no node access, i.e. composition code
+  written by hand, by an assistant, or arriving inside somebody else's
+  project — could read any file the user can. A directory allowlist was
+  considered and rejected: media lives wherever the user picked it, and a
+  project loaded through `kadr_eval` never passes main at all, so the
+  allowlist would have had holes exactly where a miss means a black preview. Startup reaps only verified orphaned Codex sessions; shutdown force-exits
+  (window-all-closed → app.exit failsafe, render-process-gone → exit).
+- `electron/ffmpeg.ts` — ffprobe probing (+ thumbnails + peak/RMS waveform
+  bins), `makeProxy` (540p preview proxies), `makeReversed` (backwards
+  render of a clip's source range, RAM-bounded chunks), `ExportMuxer`
+  (per-segment `volume,atempo*,afade,adelay,apad,atrim` → `amix` with
+  exact level compensation), `RawVideoEncoder` (fallback raw-frame
+  encoder; the primary one is spawned by the preload).
+  TWO LIMITS A BIG TIMELINE WALKS INTO, both met on a real 19-minute edit
+  carrying ~1000 SFX clips. One graph with N padded inputs costs the ffmpeg
+  scheduler roughly QUADRATICALLY in N: that mix ran at a quarter of realtime —
+  80 minutes of muxing for 19 minutes of video. Past `PREMIX_THRESHOLD` (64)
+  segments, `premixSegments` decodes each segment separately through the SAME
+  chain (`segmentChain`: volume, atempo, fades) to f32 PCM and sums it into one
+  buffer at its timeline offset — linear in total clip length instead of
+  quadratic in clip count — and the muxer then sees a single input. Levels are
+  identical by construction: amix divided every input by N and the following
+  `volume=N` undid it, so a plain sum lands in the same place. NB that buffer is
+  held whole in main: 48 kHz stereo f32 is ~23 MB per minute of timeline.
+  The other limit is argv: Linux caps ONE argument at 128 KB (MAX_ARG_STRLEN),
+  and that many clips build a `-filter_complex` past it — spawn failed with
+  E2BIG. The graph is written to a file and passed as `-filter_complex_script`,
+  on every export rather than only the big ones.
+  A FAILED MUX NO LONGER BINS THE VIDEO: the stream is rendered first and can
+  take hours, and the mux ran with that temp file scheduled for deletion in
+  `finally`. A non-cancelled failure that has video keeps it, and the error
+  message says where it is.
+- `electron/agent.ts` — embedded Codex CLI, with configuration and executable
+  lookup in `agentConfig.ts`, skill synchronization in `agentSkills.ts`,
+  authenticated loopback HTTP in `agentBridge.ts`, and Linux orphan ownership
+  records in `agentSessions.ts`. Open/close are serialized and generation
+  checked; stale output and exit events cannot affect a newer session. The
+  panel remounts when the project identity or working directory changes.
+  `codex-env.json` contains optional command/extra args/env; normal Codex auth,
+  model and approval/sandbox settings stay in the user's own configuration.
+  The per-session MCP table is passed with `-c`, and `--no-daemon` keeps its
+  secret and lifecycle out of a shared background process. The token is
+  passed through `KADR_BRIDGE_TOKEN`, never argv or a project file.
+  Startup cleanup only kills Linux groups whose recorded owner is dead AND
+  whose recorded process start time still matches; do not revive broad
+  path-substring process sweeps. User-owned skills/symlinks are preserved;
+  cleanup removes only Kadr-managed SKILL.md files, never added references.
+- `electron/mcp-bridge.cjs` — provider-neutral MCP stdio server. Standard
+  initialization `instructions` describes the live editing workflow without
+  replacing developer instructions or automatically starting a model turn.
+  Tools include state/eval/snapshot/sheet, export/transcription, Remotion,
+  checks, models, music, sound and voice-over operations. Every /eval request
+  needs a per-session secret and rejects browser Origin headers. Request and
+  response sizes are bounded; timeout/disconnection can mean an unknown
+  outcome, so read live state before retrying mutations or paid synthesis.
+  See [Codex setup](codex.md) for current arguments and host boundaries.
+- `electron/transcribe.ts` + `scripts/transcribe.py` — faster-whisper
+  runner (VAD, anti-hallucination thresholds and post-filters, NDJSON
+  segments with word timestamps); audio comes from an ExportMuxer mixdown
+  (WYSIWYG).
+- `shared/envelope.ts` + `electron/envelope.ts` — loudness envelope of a
+  timeline range (Blender "Bake Sound to F-Curves" semantics: channels
+  summed, |s|, one-pole follower with 5 ms attack / 200 ms release, frame
+  sampling by linear interpolation), computed in main over an ExportMuxer
+  mixdown (`audio:envelope` IPC). Feeds `src/engine/neonWave.ts` — the 🌊
+  neon-wave generator: an audio-reactive fragment whose TSX bakes the
+  envelope (`ENV`) and style (`S`); the final look pass replays Blender's
+  compositor Lens Distortion exactly in a WebGL shader (per-axis uv·sc
+  with sc = 1/(1+max k), d = 1/(1+√(1−4k·r²)), per-channel k for
+  dispersion). Empty segments short-circuit to zeros — ExportMuxer with
+  no inputs builds an ffmpeg command without any `-i` and fails.
+- MUSIC — beats, audio-reactive fragments, the sound library (taken over
+  from /brag, latent-spaces/brag; bundled media and licences in
+  `resources/`, see `resources/CREDITS.md`).
+  `shared/audioAnalysis.ts` ports librosa 0.11's `beat_track` (onset
+  strength over 128 Slaney mel bands, autocorrelation tempogram with a
+  log-normal prior at 120 BPM, Ellis' DP, the 0.11 trim rule) and matches it
+  beat for beat on the bundled tracks. Traps encoded in check-beats: librosa
+  0.10 and 0.11 trim differently, `np.hanning(5)` is symmetric while
+  `get_window('hann', 5)` is periodic, Python's `round` is half-to-even, and
+  the onset envelope is shifted by 3 frames on purpose. Analysis runs at
+  44.1 kHz: at 22.05 the tempo is quantised too coarsely to report right.
+  THE GRID IS MOVED ONTO THE ATTACKS when librosa's is systematically off
+  (`alignBeatsToAttacks`): on a brickwalled track whose 808 starts out of a
+  sidechain gap, the onset-strength peak comes when the note is already
+  sounding, and every beat sat ~110 ms after the bass. The analyser keeps
+  1 ms energy envelopes (< 150 Hz and full band); per beat the attack is the
+  steepest rise in [−180, +60] ms at −6 dB of the level it rises to; the grid
+  moves only when ≥ 60 % of beats have one, their IQR ≤ 50 ms and the median
+  is beyond 25 ms. On the bundled tracks nothing moves, so the parity holds;
+  `analyzeBeats(a, { alignAttacks: false })` is the raw grid. Traps: a 5 ms
+  RMS of a 50 Hz note dips at every zero crossing (the low band needs
+  ≥ 20 ms), a smoothed envelope needs a rise span as wide as its window, and
+  a centred window of width W crosses −6 dB of a step W/4 early. Not fixed by
+  it: places where the tracker loses its phase outright.
+  Beats are markers (`TimelineMarker.kind = 'beat'`) drawn as thin lines;
+  `snapPoints` includes every marker (beats unless the magnet is off,
+  `useSettings.snapBeats`) and takes marker ids in `exclude`.
+  `src/engine/audioReact.ts` bakes the sound under a fragment into
+  `audio.json` + `audio.ts` in its folder (per composition frame; τ plays at
+  `clip.start + (τ − inPoint)/speed`; ±8 s of context for a steady tempo);
+  `clip.audioBake.hash` makes the Inspector say stale, and the exporter
+  re-bakes stale ones before rendering.
+  `electron/sounds.ts` + `shared/sfxFeatures.ts`: the library. Labels were
+  REVERSE-ENGINEERED from /brag's published ones (magnitude share in
+  4–16 kHz, frames within 18 dB of the loudest; depth-2 trees agree
+  96–99 %); inputs must be the channel MEAN (ffmpeg `-ac 1` scales stereo by
+  √2). A sound's HIT (attack of its loudest event) is what `addSound` puts
+  on the beat; a sound with no single event gets hit 0. The user's own
+  sounds live in `userData/sfx/<family>/`, analysed once and cached by
+  size+mtime+`SFX_ANALYSIS_VERSION`. `placeAudio` picks an audio track FREE
+  over the whole span (overlap on one track would crossfade the music).
+- `shared/audioMaster.ts` — the export master limiter: the mix used to reach
+  the encoder over full scale. alimiter at −1 dBFS; ffmpeg 4.3's alimiter
+  delays by its look-ahead (239 samples at 48 kHz / 5 ms) and never flushes
+  it, so the chain pads 239 samples in front and trims them after — bit
+  identical and the same length below the limit. Analysis mixdowns pass
+  `master: false`.
+- `electron/fragments.ts` — Remotion workspace (`~/kadr-fragments`):
+  scaffold, vite dev server (watchdogged), fragment create/delete,
+  `remotion render` once per content hash at near-lossless settings
+  (PNG frames; vp9+alpha `--crf=12` for transparent, h264 `--crf=15`
+  otherwise; cached in `userData/fragment-renders`), offscreen
+  pixel-capture windows (created with `enableLargerThanScreen` — some
+  window managers/displays clamp hidden windows otherwise). The player
+  page syncs to the editor clock by nudging playbackRate, not seek jumps.
+  Every cache in the app builds into a `<key>.part.<ext>` sidecar and is
+  RENAMED on success, so the presence of a cache file always means
+  "finished". This matters most for fragment renders: remotion writes its
+  output progressively, and a killed render used to leave a truncated file
+  exactly where the next export looks for a hit — loud for an opaque
+  fragment (an mp4 without its moov box does not probe) but SILENT for a
+  transparent one, since a short WebM parses fine and just ends early.
+  `sweepPartFiles` drops leftover sidecars at startup: nothing is building
+  then, so any that exist are corpses.
+  Progress parses both remotion phases, "Rendered N/M" and "Stitched N/M"
+  (older versions say "Encoded"), on a bounded tail of the output: the
+  second phase used to be invisible, and a heavy transparent fragment sat
+  on one number for many minutes. `cancelFragmentRenders` (IPC
+  `fragment:cancel-render`, also called on quit and by the export's cancel)
+  SIGKILLs a snapshot of the whole process TREE — remotion starts Chrome in
+  a process group of its own, and on SIGTERM it launched a fresh Chrome that
+  was reparented to init and stayed — then removes the render's
+  `react-motion-render*` frame dir. Content trap: per-frame random noise
+  (film grain) in a transparent fragment makes every PNG and VP9 frame
+  incompressible (measured 119 MB / 144 s vs 3.6 MB / 40 s for 120 frames);
+  put grain on its own track as a short looped RGBA clip. Speed note:
+  remotion stitches with libvpx-vp9 and no speed flags; `-row-mt 1` is ON
+  (the managed config, chained after the user's own override via
+  ConfigInternals; `KADR_VP9_ROW_MT=0` turns it off). It is NOT
+  bit-identical — frames differ from a plain encode at ~54–58 dB — but both
+  are equally close to the lossless frames (colour 55.72 vs 55.73 dB, alpha
+  62.33 vs 62.34), and the speed-up is content-dependent (10–80 %).
+  Preview stacking: fragment iframes sit OVER the GL canvas, so they are
+  appended bottom track first, and `fragmentNeedsCapture(track, clip,
+  project)` sends a fragment through pixel capture whenever something
+  GL-drawn overlaps it in time on a track above — otherwise an opaque
+  fragment on a low track hid every ordinary clip over it (the export was
+  always right). Hot reload: chokidar does not follow a symlinked folder
+  that appears after the dev server started (every fragment created in a
+  saved project), so the generated vite config carries
+  `followProjectFragments`, which watches the real folders and replays their
+  events on the symlinked path — and re-watches a folder deleted and created
+  again at the same path (the watch dies with the folder; the inode is not
+  a reliable sign — tmpfs reuses it — so it asks chokidar's `getWatched()`).
+  The dev server outlives app restarts; when Kadr's vite.config template
+  changes, the running server restarts itself, so `ensureServer` waits while
+  the port is taken, adopts a server that won the race, and serializes
+  starts (probing once used to spawn a second vite that died on «port in
+  use»).
+  PREVIEW SPEED (a project of eight heavy three.js fragments): each fragment
+  page loads ONLY its fragment (`src/fragments/lazy.ts`; the page imported
+  the whole registry — every fragment of the workspace — before), runs in a
+  process of its own (`f<slot>.localhost`: each is a site, hence a process;
+  the lowest free slot, so the incoming and outgoing pages never share a
+  main thread), draws its ThreeCanvas on DEMAND at the displayed size (a
+  vite-only shim `src/_kadr/three-preview.tsx`; `remotion render` never
+  sees it), parks at opacity 0.001 (not visibility:hidden — bringing a
+  page back cost ~100–250 ms of nothing), shares one page across butt-joined
+  clips that continue each other, and follows the clock through a store
+  subscription. Measured: the next fragment's first frame 2.3 s → 42–76 ms,
+  a page's heap 380 → 62 MB. Capture windows reconcile one pass at a time
+  and close on a reload of the editor page.
+  READINESS: `window.__kadrDrawn` is the frame really on the page (no
+  pending delayRender, every canvas drew it, two rAFs); the page runs one
+  empty delayRender/continueRender pair at boot (`remotion_renderReady`
+  stays false otherwise), honours a leaked delayRender for 1.5 s only, and
+  the frame a snapshot waits for is clamped to the composition.
+  PROJECT LIBRARY: `<project>/kadr-lib` is `'@lib/…'` for every fragment
+  of a saved project (vite and webpack resolve by the importer's realpath);
+  `'@kadr/runtime'` (fonts, `defineInspect`, `defineParams`) and
+  `'@kadr/three'` (the 3D kit) are managed files from
+  `electron/fragment-kit/`. Fonts in kadr-lib/fonts are registered by the
+  page and the render entry, never by a component. Renders go through ONE
+  entry (`src/_entries/current.tsx`, rewritten inside the render queue)
+  and one managed `kadr.remotion.config.ts` — webpack names its cache
+  after the whole config, and an entry per fragment grew that cache to
+  gigabytes. `fragmentHash` walks kadr-lib and `src/_kadr` only when the
+  sources import them. The workspace's package.json/tsconfig are merged and
+  missing deps installed on start. `kadr_typecheck` checks one fragment.
+  PARAMETERS: `defineParams`/`useParams`; the Inspector posts LIVE values to
+  every page of the fragment and, after 400 ms of quiet, main MERGES only
+  the moved values into `params.json` as it is on disk (an edit by hand in
+  between survives); the dev server announces a params.json change from the
+  WATCHER (a created file never reaches handleHotUpdate) and pages reload
+  the values, not themselves; the render entry imports the file.
+- `src/state/store.ts` — zustand store. Undo convention: callers invoke
+  `pushHistory(labelKey)` once before a discrete edit; high-level actions
+  push their own. `sanitizeProject` heals foreign/script-written projects
+  on load (scalar Anims → {value}, broken keyframes dropped, missing
+  fields defaulted). File-backed preset stores (pose/fx) via user-store IPC.
+  `insertClipsFromAssets` lays several assets back-to-back in one undo
+  (audio → audio track, AV twins as usual); `removeAssets` drops bin
+  entries AND every clip using them (one undo); `setClipSpeed` rescales
+  keyframes/fades and takes an optional `start` (left-edge speed drags
+  keep the right edge anchored).
+  COPYING THE PROJECT IS THE HOT PATH. A project is deep-copied TWICE per
+  edit — once by `pushHistory`, once by the mutation itself (33
+  `cloneProject` call sites) — so a drag copies it on every pointermove and
+  the undo stack retains 50 of them. An asset's `waveform`/`thumbnail`/
+  `thumbnailEnd` are almost all of a project's bytes: measured on a real
+  78 MB project, the waveforms were 78.1 of it. A full
+  `JSON.parse(JSON.stringify())` there took 248 ms — four frames a second
+  while dragging a clip — and 50 history entries held 3.82 GB, which is
+  exactly where V8 quits: that renderer died three times in one day with
+  «OOM error in V8: JavaScript heap out of memory», the last GC line
+  reading 3841 MB of 3847.8. `cloneProject` therefore SHARES those three
+  fields instead of duplicating them: 0.58 ms and 18 MB for the same fifty
+  entries.
+  THE INVARIANT IT RESTS ON: nobody mutates a waveform or a thumbnail in
+  place. They are written once, wholesale, by the probe in
+  `electron/ffmpeg.ts` and only ever read afterwards — those three fields
+  are assigned in exactly one file in the whole tree. If that stops being
+  true, the sharing has to go with it.
+  The copy is built key by key rather than by blanking the blobs and round
+  tripping, so the live project is never modified even for an instant, key
+  order survives, and the result serializes byte for byte like a plain deep
+  copy; values JSON drops (undefined, functions, symbols) are dropped the
+  same way, and junk in `assets` falls through to a plain copy. Test: e2e28
+  — the sharing, that fifty entries hold one waveform, that undo restores it
+  whole, and that a project written to disk AFTER an undo still carries its
+  waveforms (a copy that quietly lost one would stay invisible until that
+  project was reopened). The two behaviour checks were verified to fail with
+  the sharing switched off.
+- `src/engine/mediaImport.ts` — every media intake path: `importFiles`
+  (probe → bin, deduped by path, optional timeline placement),
+  `dropPayload` (reads dataTransfer SYNCHRONOUSLY: files → uri-list /
+  x-moz-url / DownloadURL → portal key), `importDrop` (paths → URLs →
+  raw blobs), window-level catch-all drop in App.tsx, drop forensics to
+  `window.__dragLog` + `userData/drop-log.jsonl`.
+- Clip speed UX (`Timeline.tsx`): Ctrl-drag on either extend grip or
+  clip edge = 0.02–100× with ~16 px snapping to round multipliers AND
+  neighbouring clip edges/playhead; a cursor-following ×N badge lights up
+  when snapped. Preview clamps element playbackRate to Chromium's hard
+  [0.0625, 16] range — out-of-range assignment THROWS.
+- `src/engine/player.ts` — pure layer/audio queries, `MediaPool`,
+  `drawFrame` (shared by preview and export), `Player` (anchored rAF
+  clock, ~4 fps idle when paused; the tick is exception-proof — one bad
+  frame never kills playback; element resync never reseeks mid-seek and
+  aims ahead by 0.08×speed so software decode can't storm).
+  The pool keeps elements only for clips around the playhead
+  (`clipsAround`: starting within 8 s, ended within 3 s), and `release`
+  disconnects an element's WebAudio source and gain (`detachAudio`). It
+  used to keep one for every clip ever touched, wired into the graph for
+  good: a 19-minute, 1080-audio-clip project ended its playthrough with
+  1080 routed sources, a median frame of 23 ms instead of 7, and 33–53
+  corrective seeks (each a gap you hear) per 30 s — 169 in all; after: 7,
+  pool ≤ 15. `previewPoolStats()`, `audioStats()` (with
+  AudioContext.playbackStats) and `silencePreview(on)` on kadrEditor are
+  there to measure it.
+- `src/components/Timeline.tsx` + `src/engine/timelineMath.ts` — on big
+  projects: clips culled to the view ± half a screen (plus the selection)
+  once the content is longer than 4 screens; `ClipView` is memo'd and gets
+  its visible slice (a constant pair when off screen); a clip under 6 px is
+  one element; clip geometry is `calc(var(--z) * N px)` so a zoom is a
+  style change, with zoom-dependent decisions following a settled zoom; the
+  visible seconds are derived from the scroll PIXELS in render. Zoom
+  gestures (wheel, slider) only scale the drawn lanes, ruler and
+  `.tl-overlays` about the anchor and commit once the gesture pauses (or
+  stretches past 0.5–2×, or on any pointerdown), keeping the anchor time
+  across chained commits. Waveform columns are sliding-window maxima,
+  k chosen per pixel — EXACTLY the old full scan (a merged-bin pyramid
+  smeared lone clicks and was rejected); overlap zones are one sweep.
+  Measured and rejected: CPU rasterisation (faster timeline, worse preview
+  and export), software waveform canvases, dropping clip decorations.
+- `src/gl/compositor.ts` — WebGL2 quad compositor: perspective-correct 3D,
+  masks (crop + up to 8 shapes), transition FBOs, motion-blur accumulator,
+  glow + gaussian-blur effect passes (`drawLayerFx`), raw-BGRA capture
+  upload, packed colour-over-matte sampling for alpha video
+  (`LayerDraw.alphaPacked`), and pipelined readback for the export pipe
+  (`startRead`/`finishRead` through a pixel-pack buffer). `holdSources`
+  keeps a dynamic texture from re-uploading once per motion-blur
+  sub-sample.
+  CONTEXT LIFECYCLE: `dispose()` frees the GL resources and drops the
+  context — ONLY for a compositor on a throwaway canvas (the exporter
+  builds one per run). A canvas hands out the SAME context object
+  forever, so disposing the preview's compositor would black the preview
+  out for good; `Player.detach` therefore leaves it alone. `contextLost()`
+  exists because a lost context makes every GL call a silent no-op —
+  `readPixels` leaves its buffer untouched, so an export would finish
+  "successfully" as a black file. The exporter checks per frame and after
+  the last one; the preview asks for the context back on
+  `webglcontextlost` and rebuilds on `webglcontextrestored`. Two traps
+  worth knowing: `getExtension` returns null on a LOST context (take the
+  `WEBGL_lose_context` handle while it is alive), and `restoreContext()`
+  is ignored when called from inside the lost event — defer it a turn.
+- `src/gl/transitions.ts` / `src/gl/edges.ts` / `src/gl/glow.ts` — GLSL
+  registries: 14 overlap transitions, 12 edge (tip) transitions, the smoky
+  outer-glow effect.
+- `src/engine/exporter.ts` — offline render: fragment materialization →
+  fast decode (`src/engine/demux.ts`, mp4box + WebCodecs, element-seek
+  fallback, `KADR_DISABLE_FAST_DECODE` kill-switch) → optional 8-sample
+  motion blur and per-clip frame blending → ffmpeg x264 encode at the
+  preset bitrate (the preload spawns ffmpeg and receives readPixels
+  frames BY REFERENCE — contextIsolation is off exactly for this; every
+  IPC/bridge route copies ~8 MB per 1080p frame and tripled render time;
+  Chromium's own WebCodecs encoder ignores the requested bitrate and
+  stays behind the «fast encoder» checkbox) → main-process ffmpeg mux
+  pass. `src/engine/reverse.ts` — clip reversal flow (cached backwards
+  renders, linked AV pairs, ⏳ progress).
+  DECODE SPEED is the whole game here: an element seek costs ~0.2 s per
+  frame, so everything that can avoid it does.
+  * ALPHA VIDEO (VP9+alpha WebM — every transparent fragment render —
+    ProRes 4444, HEVC-alpha) has no WebCodecs path in any browser, so
+    `alphaPackedFallback` builds a cached LOSSLESS H.264 mp4 that stacks
+    the colour frame over its alpha matte (2× height) and the shader
+    splits it apart again. The packer normalises the picture to BT.709
+    with a pure matrix change and writes NO colour tags, and
+    `Mp4FrameSource` re-wraps the frames as BT.709 on the CPU: a tagged
+    frame goes through Chromium's colour-managed upload, which rewrites
+    mid-tones and would lift the matte (128 → 143). `KADR_DISABLE_ALPHA_PACK`
+    forces the old path.
+  * MOOV AT THE END (any file not written with faststart) is picked up by
+    fetching the file's tail (`pumpTail`) instead of dropping to element
+    seeks.
+  * A SEEK MUST DROP mp4box's HALF-COLLECTED BATCH: mp4box keeps the
+    samples it was gathering towards the next `nbSamples` callback across
+    `seek()` and sends them FIRST. Init's `jump(0)` met that whenever the
+    head pump had already extracted a batch — on light files (flat
+    graphics, small renders) always. Either the fresh decoder got a later
+    keyframe first and showed that frame for the clip's first request, or
+    it got a delta («A key frame is required»), `open()` returned null and
+    the clip silently exported through element seeks. `jump()` clears the
+    track's `extractedTracks[].samples` after the seek. Test: e2e52.
+  * A STATIC SHUTTER collapses: `frameSignature` records what drawFrame
+    would draw without touching the GPU, and when every motion-blur
+    sub-sample matches, one draw stands in for eight — exact, and
+    `KADR_FORCE_FULL_SHUTTER` restores the full pass.
+  * Frame blending is skipped for alpha sources: compositing B over A
+    reproduces lerp(A,B,w) only while the layer is opaque.
+  * `rawEncodeFrame` resolves on stdin's WRITE CALLBACK — `write()`
+    returning true only means "keep writing" while the chunk may still
+    point at the buffer the exporter is about to refill (torn frames).
+  * ffmpeg leaves x264's b_deterministic off, so two identical runs never
+    produce identical files: verify picture changes by hashing rendered
+    frames (`globalThis.KADR_FRAME_HASH = []`), never by comparing output.
+  * The raw-frame ring is TWO buffers by measurement, not by default. The
+    loop does spend a few ms per frame waiting there, but the pipe is
+    drained by libuv on the same thread, so a deeper ring adds no
+    concurrency, only working set: 1080p60, alternating rounds, 2 slots
+    50.5 fps / 3 slots 45.7 / 4 slots 45.3, pixels identical at every depth.
+  WHERE AN EXPORT'S TIME GOES, so the next person profiling does not repeat
+  the dead ends. Every run prints `[kadr] export stage ms/frame`; on a real
+  1080p60 project it reads roughly prepare 0.3 · draw 1.7 · read 9.4 ·
+  encode 6.2, i.e. most of the time is the frame LEAVING the renderer, not
+  compositing or decoding. Two traps: `read` is TRANSFER, not a wait on the
+  GPU (a `gl.finish()` after the draw moves nothing between the laps), and
+  it is contention-sensitive — the same 8.3 MB measured 3.3 ms on an idle
+  machine and 9.4 ms on a busy one, so profile idle or you will chase a
+  ghost. The one real lever left is that ffmpeg receives RGBA and converts
+  it to yuv420p itself, which costs it more than the encode: measured
+  ceilings on identical frames are 89.5 fps for what ships, 121.5 from
+  yuv444p and 181.8 from yuv420p, and converting on the GPU would cut the
+  readback to 3.1 MB as well — worth roughly 2×. It is NOT done because it
+  cannot yet be made bit-exact, and exports must not change a pixel.
+  swscale's path is understood — textbook BT.709 limited matrix (exact on
+  uniform fields), a plain horizontal pair average, and an 8-tap vertical
+  chroma filter (-2,-6,16,56,56,16,-6,-2)/128 summing to exactly 1 — which
+  gets a float model within ONE unit of 255 on 0.05% of luma and ~1.4% of
+  chroma samples (whole-frame PSNR 71.3 dB), but the last unit is
+  swscale's internal fixed-point rounding and no one- or two-stage integer
+  model reproduced it, for 4:2:0 or 4:4:4. Implement it from libswscale's
+  source, not by measurement. Also: `-sws_flags` on the command line does
+  NOT reach this conversion (the scale filter's own `flags` default wins),
+  so an A/B on those flags that compares output bytes proves nothing, and
+  filter threading is already on by default.
+  ONLY THE FRAMES THE EDIT USES: a film cut as windows of one continuous
+  composition (every scene a fragment whose clip starts at inPoint = its
+  place in the film) used to render each fragment from frame 0 to its end —
+  measured on a 26-minute film, 1.6 million frames for the 93 thousand the
+  edit shows, about 35 hours. `fragmentRenderJobs` (exporter.ts) groups the
+  clips of a fragment by the composition seconds they show (±
+  `FRAGMENT_RANGE_MARGIN` 0.5 s for the shutter, blending and rounding;
+  clips more than `FRAGMENT_RANGE_GAP` 10 s apart get files of their own),
+  main renders `--frames=f0-f1` into `<base>-r<f0>-<f1>.<ext>` and answers
+  `start` (the clips' inPoint moves back by it). Frames are absolute, so the
+  fragment draws exactly what a full render drew; a clip looping past the
+  end is clamped to the last frame, so its loop span is unchanged; a full
+  render already on disk is always taken first. The asset's duration is the
+  PICTURE's (frames / fps): remotion's silent audio runs up to ~60 ms past
+  the last frame, and a looping clip held its last frame that long.
+  Test: e2e52.
+  ONE EXPORT AT A TIME: the preload's raw encoder is a single global ffmpeg
+  and main's export state and the fragment render queue are shared, so an
+  export started while another ran (a script's `startExport` plus the
+  dialog's) fed its frames into the other's encoder — both died at 100 %
+  («write after end» / «write ECANCELED»), and the second one looked frozen
+  until then. `startExport` refuses while `activity.exporting` is set.
+- `src/engine/subtitles.ts` / `captions.ts` — SRT parse/serialize,
+  word-precise cue splitting (`segmentsToRichCues`), auto-captions
+  fragment generator.
+- `src/engine/fragments.ts` / `fragmentCapture.ts` — fragment create and
+  delete flows (`deleteFragment` removes the clips referencing it too)
+  and the hybrid preview: iframe overlay by default, automatic pixel
+  capture when the clip carries GL-only features (effects/3D/masks/
+  transitions).
+- RHYTHM (`shared/rhythm.ts`, on top of the librosa port): the meter and the
+  "one" (kick + bass + harmonic change − backbeat snare), sections from
+  self-similarity plus loudness jumps, pauses as relative dips that do not
+  repeat every bar, the kick offset. Markers `kind: 'beat'|'section'|'pause'`;
+  bakes take bars and sections from a 60 s context and give fragments
+  `useAccent/accentAt/breathAt/sectionAt/bars/pauses`.
+- CHECKS (`src/engine/checks.ts`, «Проверка», `kadr_check`): fragments
+  declare `inspect` (events, texts, camera, continuous); a hidden `?inspect=1`
+  page samples it at 30 Hz. Thresholds are named constants (`CHECK_LIMITS`);
+  camera jerks are speed STEPS against the local peak (raw acceleration
+  flagged accepted cameras) on samples kept to 1e-6. Contrast and seams read
+  real pixels; collisions play the fragment frame by frame (`?collide=1`)
+  and test the kit's parts with three-mesh-bvh (both geometries need an
+  index).
+- 3D (`electron/models.ts` → `kadr-lib/models`): STL, 3MF (build items,
+  components in other package files, units — without them a 150 mm part
+  came out 2 mm), OBJ, glTF, STEP via occt-import-js; Z-up → Y-up, welding,
+  meshoptimizer decimation, an OBB per part, GLB in metres, a thumbnail
+  drawn in software. The kit's `useModel` takes one delayRender per model,
+  tied to the load.
+- HDR AND ROTATION (`shared/hdr.ts` + `electron/hdr.ts`): a 33³ LUT between
+  two swscale matrix conversions (no zscale in older ffmpeg): the transfer's
+  inverse and OOTF, an extended-Reinhard shoulder with a 1000-nit peak at 1,
+  BT.2020 → BT.709 towards the colour's own luminance (keeps the hue), BT.709
+  OETF. Two faults `check-hdr` found in the first curve: an exponential
+  shoulder that flattened every highlight above 1.3× reference white, and the
+  shoulder applied before the primaries (warm colours clipped towards
+  yellow). `HDR_VERSION` is in the LUT name and every tone-mapped cache key.
+  Rotated or HDR sources reach the export through an ffmpeg intermediate,
+  decided BEFORE the fast decode path.
+- `electron/gpu.ts` — which GPU Chromium renders on (auto / discrete /
+  integrated, a row in the session log). The EGL vendor variable must be in
+  the environment before Electron starts (the GPU process forks from the
+  zygote). On a hybrid laptop the discrete card measured SLOWER for the
+  preview (every frame is copied to the integrated card to be shown), so
+  'auto' keeps the default.
+- The onion skin (`src/engine/onion.ts`, `OnionSkin.tsx`): a footage clip as
+  a `<video>` over the preview, translucent or in difference mode, never in
+  snapshots or exports; selecting a fragment (to drag its sliders) does not
+  steal it.
+- `src/engine/autosave.ts` — 5-minute autosave with `activity` flags
+  (paused during export and voice checks; an open Codex panel does not pause it).
+- `src/engine/chime.ts` — short WebAudio two-note signal when a render
+  finishes (wired to export progress in `src/main.tsx`).
+- Timeline markers live in `project.markers` (`addMarker`/`moveMarker`/
+  `removeMarker` in the store, flags drawn by `Timeline.tsx`, M key in
+  `App.tsx`): project-wide time labels, not bound to a track, and part of
+  `kadr_state` so the embedded Codex can read and place them.
+- `electron/tts.ts` + `src/engine/tts.ts` + `shared/ttsText.ts` — ElevenLabs
+  voice-over. THE KEY NEVER REACHES THE RENDERER: the page is scriptable
+  (`kadr_eval`), so the key lives in `<userData>/elevenlabs-key.json`,
+  written 0600 on the `open()` rather than chmod'ed afterwards, and the
+  page can only set it or ask whether one exists. `TtsParams` has no key
+  field. Long text is cut at the strongest available boundary (paragraph →
+  sentence → clause → space) under the model's cap and stitched with
+  previous_text/next_text plus previous_request_ids; the pieces rejoin to
+  the input BYTE FOR BYTE, because the defect detector addresses the
+  script by character offset and one lost space would shift every later
+  index. The optional speed-up rides the same ffmpeg pass as the decode
+  and is stored on the run, never re-read from the current settings — a
+  regenerated phrase must be sped up like the file it goes into. Output is
+  FLAC in the source's own channel layout: forcing stereo duplicated the
+  channel and cost exactly 3.01 dB through ffmpeg's downmix matrix.
+  `KADR_TTS_MOCK=1` synthesises speech-shaped audio locally so tests never
+  spend credits.
+- `shared/proxy.ts` — which proxy the API calls use, and how to spell it
+  for Chromium (`https=host:port;http=host:port`, or a full `socks5://`).
+  `net.fetch` always uses the DEFAULT session, whose proxy Chromium picks
+  by itself and may well settle on HTTP_PROXY when only HTTPS_PROXY can
+  reach the API — the proxy's own error PAGE then arrives where JSON was
+  expected («Unexpected token '<'»). The module owns a partitioned session
+  and sets the proxy explicitly. Node's fetch is not an option: it ignores
+  proxy environment variables entirely. Test: `node scripts/check-proxy.mjs`.
+- `electron/voice.ts` + `python/ttsqc` + `scripts/ttsqc_run.py` — the
+  voice-over defect detector, vendored with its light weights. Findings
+  land in `Project.defects`, runs in `Project.voiceRuns`; TIMES ARE SOURCE
+  SECONDS AND THE RECORD BINDS TO `assetId`, not to a clip — clips are
+  moved, trimmed, split and rippled, so a timeline number would be stale
+  after the first edit, while a source number only goes wrong when the
+  FILE changes, which is exactly what invalidates the finding anyway.
+  Phrase boundaries are computed in `python/kadr_phrases.py` (pure
+  numbers, testable on synthetic audio via `scripts/check-phrases.py`):
+  the cut is the middle of the LONGEST REAL SILENCE in the gap between
+  sentences, found from Silero speech probabilities refined by 5 ms RMS.
+- `src/engine/voiceRegen.ts` + `shared/voiceMap.ts` — regeneration.
+  EVERYTHING CONFIRMED ON ONE VOICE-OVER IS DONE IN ONE PASS: doing them
+  one at a time would mean recomputing every later cut inside an
+  already-shifted file. The patch is synthesised from the exact script
+  substring with surrounding context, sped up by the RUN's factor, matched
+  to the level and edge silence of what it replaces, and spliced with
+  `acrossfade=c1=qsin:c2=qsin` (a linear fade dips 3 dB mid-speech). The
+  new length is MEASURED with probeMedia, never computed, and everything
+  to the right shifts on all unlocked tracks. A clip whose EDGE falls
+  inside a replaced phrase is refused by name instead of being guessed at.
+  `voice:reindex` carries the analysis over the splice, because the index
+  describes the file as it was analysed and every splice rewrites it.
+- `src/engine/voiceLearn.ts` — verdicts go to the run's own corpus in the
+  detector's format. HAND-PLACED MARKS GO IN A SEPARATE FILE: a verdict
+  row matching no candidate lowers the match count, and once such rows are
+  more than half the file the WHOLE file is discarded, real labels
+  included. Retraining is never automatic — it rebuilds from scratch, so
+  the previous model is copied aside first, cross-validation numbers are
+  printed, and it refuses below 30 examples across ≥2 files.
+- `src/styles.css` — THE design system, and the only place a colour, a
+  size, a radius or a duration may be born: `:root` holds the neutral ramp
+  and accent, the same colours as channels for washes, and the editing
+  colours that are part of the model rather than decoration. Nothing below
+  `:root` carries a literal colour — a grep for `#` outside the token
+  block must come back empty. Contrast is MEASURED against WCAG 2.2 AA.
+  SCROLLBARS are a trap: Chromium's standard properties and the
+  `::-webkit-scrollbar` pseudo-elements are mutually exclusive — set
+  `scrollbar-width` to anything but `auto` and every pseudo-element rule
+  is dropped silently, and only the pseudo-element path can set a MINIMUM
+  thumb size, which the timeline needs (its thumb is proportional to the
+  zoom and degenerates to under a pixel at high zoom).
+- `src/components/icons.tsx` — the icon set: lucide (ISC) inlined as SVG,
+  no dependency and no network. GENERATED by `scripts/gen-icons.mjs`; add
+  a glyph by adding a line to its MAP, never by hand-editing the paths.
+  Emoji used to do this job and are banned from the interface: their
+  shape, weight and colour come from whatever font the OS ships.
+- `src/components/Modal.tsx` — the one shell all dialogs use: titled head,
+  scrolling body, fixed footer, `role="dialog"`, Escape, a real focus trap
+  and focus restored. It also exports `modalsOpen()`, which App.tsx checks
+  before acting on a global shortcut — Space on a focused dialog button
+  used to press the button AND start playback behind it.
+- `src/engine/log.ts` + `src/components/DebugPanel.tsx` — the session log.
+  Twenty places reported failures with `console.warn` and nothing else, so
+  a snapshot that did not happen and an import that brought nothing in
+  both looked like "I clicked and nothing happened". IN MEMORY ONLY: a
+  ring of 500 entries that dies with the window. The button is silent
+  until something fails; INFO never raises it, and benign browser notices
+  (`ResizeObserver loop …`) are recorded as INFO rather than as failures.
+- `electron/storage.ts` + `electron/cacheKeys.ts` + `StoragePanel.tsx` —
+  what the editor has left on disk. The split that governs everything is
+  REBUILDABLE vs REFERENCED: a proxy, a decoded intermediate and a
+  fragment render are named after their source (a hash of path+size+mtime),
+  so deleting one costs time and nothing else; a reversed clip, a download
+  and a voice-over run are stored BY PATH in the project and cannot be
+  derived again. The key formula lives in its own file because a second
+  copy would drift, and a drifted formula aims a delete button at the
+  wrong file. Projects are keyed BY PATH, never by name. `storage:prune`
+  FAILS CLOSED: without an explicit `confirm: true` it only counts, so a
+  caller newer than the handler errs towards keeping the files.
+- `src/engine/popout.ts` — the preview in an OS window of its own. NOTHING
+  IS REBUILT ON THE WAY OVER: the preview always lives in ONE host div
+  that a React portal renders into, and popping out only moves that div
+  into the popup's document — re-creating it would mean a fresh GL context
+  every toggle (Chromium keeps 16 per renderer and force-loses the oldest)
+  and a reload of every fragment iframe. The popup is `about:blank` opened
+  with `window.open`: same origin and same renderer process, which is the
+  only reason the live canvas can be adopted. THE CLOCK AND THE OBSERVERS
+  FOLLOW THE CANVAS, not the window they were born in — the rAF loop
+  re-reads `canvas.ownerDocument.defaultView` every frame, and the
+  ResizeObservers in the moved subtree are rebuilt in the new window (an
+  observer belongs to the document it was created in and delivers NOTHING
+  for an element in another one). Rule of thumb for anything added inside
+  the preview: if it says `window.`, ask which window.
+- `window.kadrEditor` (set in `src/main.tsx`) — scripting surface for
+  automation / AI / MCP integration.
+
+## Testing
+`scripts/e2e*.mjs` drive the app over CDP. Async evals park results in
+globals and poll (`awaitPromise` is flaky under GC). Use disposable projects: some suites replace the live timeline. Agent
+suites require temporary KADR_USER_DATA and KADR_AGENT_SKILLS_DIR directories,
+verify the running app profile and use a fake Codex CLI. They back up/restore
+codex-env.json; no authenticated model is used.
+
+A suite that touches a user store MUST snapshot and restore it: the
+preset stores, the Codex command override, the voice-over settings and
+the ElevenLabs key are all real user data shared with real sessions, and
+each of them has been destroyed by a test at least once.
+
+## Conventions
+- All timeline math in seconds; keyframe times are clip-local.
+- Profiling over CDP: sample at ≥ 1 ms and never kill the profiling client
+  mid-run. A 200 µs profile whose client died left V8's sampler signalling
+  the main thread, and a large shared-memory allocation (a project with its
+  waveforms, sent to main for an autosave) was interrupted and restarted
+  forever — the editor froze in one syscall. Frame timing needs no profiler.
+- Mutations never auto-push history; see the store convention above.
+- `electron-vite dev` does NOT hot-restart the main process — main/preload
+  edits need a full app restart.

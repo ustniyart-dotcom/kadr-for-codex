@@ -305,7 +305,7 @@ export interface FragmentSpec {
 export interface FragmentInfo {
   id: string
   dir: string
-  entry: string // the TSX file Claude edits
+  entry: string // the TSX file the agent edits
   meta: FragmentSpec
 }
 
@@ -1306,7 +1306,7 @@ export interface KadrApi {
   /** mtime in ms, or null when missing — used to pick up external edits */
   statFile(path: string): Promise<number | null>
 
-  /** Embedded Claude Code terminal session (PTY in main + MCP bridge). */
+  /** Embedded Codex terminal session (legacy IPC method names) (PTY in main + MCP bridge). */
   claudeOpen(cols: number, rows: number, cwd: string | null):
     Promise<{ ok: boolean; port?: number; error?: string }>
   claudeInput(data: string): void

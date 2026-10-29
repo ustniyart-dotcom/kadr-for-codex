@@ -26,10 +26,12 @@ const api: KadrApi = {
     })
     rawEnc = child
     rawEncErr = ''
+    child.stdin!.on('error', () => { /* reported by the frame callback */ })
     child.stderr!.on('data', (c) => { rawEncErr += c })
     rawEncExit = new Promise<void>((resolve, reject) => {
+      child.on('error', reject)
       child.on('close', (code) => {
-        rawEnc = null
+        if (rawEnc === child) rawEnc = null
         if (code === 0) resolve()
         else reject(new Error(`raw encoder exited ${code}: ${rawEncErr.slice(0, 800)}`))
       })
@@ -37,7 +39,7 @@ const api: KadrApi = {
     rawEncExit.catch(() => { /* surfaced via frame/end */ })
     return new Promise((resolve, reject) => {
       child.once('spawn', () => resolve(out))
-      child.once('error', (e) => { rawEnc = null; reject(e) })
+      child.once('error', (e) => { if (rawEnc === child) rawEnc = null; reject(e) })
     })
   },
   // with contextIsolation off the view arrives BY REFERENCE — zero copies;

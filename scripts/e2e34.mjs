@@ -1,6 +1,6 @@
 // Test: the two locks reported from outside (issues #11 and #13).
 //
-// #11 — one panel open must spawn exactly ONE claude session. openSession is
+// #11 — one panel open must spawn exactly ONE Codex session. openSession is
 // async and closeSession is instant, so a close that overtook an in-flight open
 // used to leave the spawned pty orphaned; React StrictMode's double mount made
 // that happen on every panel open in dev, and two ptys wrote into one xterm.
@@ -10,13 +10,13 @@
 // origin with no node access, and those could read any file. Every URL now
 // carries a per-run capability token that only the preload knows.
 //
-// Launch the app with `npx electron-vite dev -- --remote-debugging-port=9777`.
+// Launch app + suite with the same disposable KADR_USER_DATA under os.tmpdir().
 import WebSocket from 'ws'
-import { execFileSync } from 'child_process'
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs'
+import { writeFileSync, unlinkSync, mkdirSync } from 'fs'
+import { assertIsolatedEditor, bridgeArgs, installAgentFixture, requireIsolatedUserData } from './e2e-agent-fixture.mjs'
 
 const PORT = process.env.KADR_CDP_PORT || 9777
-const ENV_FILE = `${process.env.HOME}/.config/kadr/claude-env.json`
+requireIsolatedUserData()
 const CANARY_DIR = '/tmp/kadr-test/issue13'
 const CANARY = `${CANARY_DIR}/canary.txt`
 
@@ -76,67 +76,27 @@ function check(name, cond, extra = '') {
   if (!cond) process.exitCode = 1
 }
 
-/**
- * The app's main process: the electron BINARY holding the debugging port, not a
- * child renderer (--type=) and not the npm/sh/node wrappers that carry the same
- * flag in their command line — match on the executable's basename.
- */
-function mainPid() {
-  const rows = execFileSync('ps', ['-eo', 'pid=,args=']).toString().split('\n')
-  for (const row of rows) {
-    const m = row.trim().match(/^(\d+)\s+(.*)$/)
-    if (!m) continue
-    const [, pid, args] = m
-    if (!args.includes('--remote-debugging-port') || args.includes('--type=')) continue
-    if (!/(^|\/)electron(\.exe)?$/.test(args.split(/\s+/)[0])) continue
-    return pid
-  }
-  throw new Error('electron main process not found')
-}
-/**
- * Live claude sessions = the watchdog subshell openSession wraps every pty in,
- * one per session. The fragment dev server guards vite with the same
- * `while kill -0 <main pid>` idiom, so the pattern also demands the claude
- * wrapper's own `kill -HUP` escalation — otherwise a running vite is counted
- * as a session.
- */
-function liveSessions(pid) {
-  try {
-    return execFileSync('pgrep', ['-f', `while kill -0 ${pid} .*kill -HUP`])
-      .toString().trim().split('\n').filter(Boolean).length
-  } catch {
-    return 0 // pgrep exits 1 when nothing matches
-  }
-}
-
 mkdirSync(CANARY_DIR, { recursive: true })
 writeFileSync(CANARY, 'CANARY-e2e34-outside-any-project\n')
 
 ws = new WebSocket(await getPageWs())
 await new Promise((r, j) => { ws.on('open', r); ws.on('error', j) })
+await assertIsolatedEditor(evalJs)
 
-// the embedded terminal must run something harmless and long-lived; a leftover
-// override from a crashed run is NOT user config (see CLAUDE.md), so treat a
-// pre-existing bash override as garbage and delete it on restore
-let envBackup = null
-try { envBackup = readFileSync(ENV_FILE, 'utf8') } catch { /* none */ }
-if (envBackup && JSON.parse(envBackup).command === 'bash') envBackup = null
-writeFileSync(ENV_FILE, JSON.stringify({ command: 'bash', args: [] }))
-
-const PID = mainPid()
+const fixture = await installAgentFixture(evalJs)
 try {
   // ---------------------------------------------------------------- issue #11
-  check('no claude session before the panel is opened', liveSessions(PID) === 0, `pids=${liveSessions(PID)}`)
+  check('no Codex session before the panel is opened', fixture.activeSessions() === 0)
 
   const opened = await evalJs(`(async () => {
-    const b = [...document.querySelectorAll('button')].find((x) => x.textContent.includes('Claude'))
-    if (!b) throw new Error('no Claude button')
+    const b = document.querySelector('.claude-btn')
+    if (!b || !b.textContent.includes('Codex')) throw new Error('no Codex button')
     b.click()
     await new Promise((r) => setTimeout(r, 4000))
     return !!document.querySelector('.claude-panel')
   })()`)
   check('the panel mounts', opened)
-  const afterOpen = liveSessions(PID)
+  const afterOpen = fixture.activeSessions()
   // StrictMode mounts the panel twice in dev; both mounts must share one session
   check('one panel open spawns exactly ONE session (issue #11)', afterOpen === 1, `sessions=${afterOpen}`)
 
@@ -146,7 +106,7 @@ try {
     return !document.querySelector('.claude-panel')
   })()`)
   await new Promise((r) => setTimeout(r, 1500))
-  check('closing the panel leaves no session behind', closed && liveSessions(PID) === 0, `sessions=${liveSessions(PID)}`)
+  check('closing the panel leaves no session behind', closed && fixture.activeSessions() === 0, `sessions=${fixture.activeSessions()}`)
 
   // the same race without React in the picture: a close that overtakes the
   // in-flight open (a fast panel toggle) must not leak the spawned pty either
@@ -157,17 +117,50 @@ try {
     return 1
   })()`)
   await new Promise((r) => setTimeout(r, 1500))
-  check('a close overtaking an in-flight open leaks nothing', liveSessions(PID) === 0, `sessions=${liveSessions(PID)}`)
+  check('a close overtaking an in-flight open leaks nothing', fixture.activeSessions() === 0, `sessions=${fixture.activeSessions()}`)
 
   // and the ordinary path still works
   const reopened = await evalJs(`window.kadr.claudeOpen(80, 24, null)`)
   await new Promise((r) => setTimeout(r, 1500))
-  check('a plain open still starts one working session', reopened.ok === true && liveSessions(PID) === 1,
-    `ok=${reopened.ok} port=${reopened.port} sessions=${liveSessions(PID)}`)
+  check('a plain open still starts one working session', reopened.ok === true && fixture.activeSessions() === 1,
+    `ok=${reopened.ok} port=${reopened.port} sessions=${fixture.activeSessions()}`)
   await evalJs(`window.kadr.claudeClose()`)
   await new Promise((r) => setTimeout(r, 1500))
-  check('and closing it kills that session', liveSessions(PID) === 0)
+  check('and closing it kills that session', fixture.activeSessions() === 0)
 
+  // A project switch must invalidate the old assistant and its capability:
+  // old instructions/cwd must never silently edit a newly opened project.
+  await evalJs(`(async () => {
+    document.querySelector('.claude-btn').click()
+    await new Promise(r => setTimeout(r, 3000))
+    return true
+  })()`)
+  const beforeSwitch = fixture.activeRecords()
+  check('project-switch fixture has exactly one live assistant', beforeSwitch.length === 1)
+  const oldPort = Number(bridgeArgs(beforeSwitch[0].argv)[1])
+  await evalJs(`(async () => {
+    const st = window.kadrEditor.useEditor.getState()
+    st.setProject({ ...st.project, id: 'e2e34-new-' + Date.now(), name: 'new test project' }, null)
+    await new Promise(r => setTimeout(r, 4000))
+    return true
+  })()`)
+  const afterSwitch = fixture.activeRecords()
+  check('opening a different project replaces the assistant with one fresh session',
+    afterSwitch.length === 1 && afterSwitch[0].pid !== beforeSwitch[0].pid &&
+    Number(bridgeArgs(afterSwitch[0].argv)[1]) !== oldPort)
+  const oldBridgeClosed = await fetch(`http://127.0.0.1:${oldPort}/`, { signal: AbortSignal.timeout(1500) })
+    .then(() => false, () => true)
+  check('the previous project bridge no longer accepts requests', oldBridgeClosed)
+  await evalJs(`(async () => {
+    document.querySelector('.claude-close').click()
+    await new Promise(r => setTimeout(r, 2000))
+    return true
+  })()`)
+  check('the replacement assistant is also cleaned up', fixture.activeSessions() === 0)
+
+  // Optional lifecycle-only run: the media capability checks below need the
+  // synthetic a.mp4 and an installed Remotion workspace/GPU-capable display.
+  if (process.env.KADR_E2E_AGENT_ONLY !== '1') {
   // ---------------------------------------------------------------- issue #13
   const media = await evalJs(`(async () => {
     const url = window.kadr.fileUrl('/tmp/kadr-test/a.mp4')
@@ -254,9 +247,9 @@ try {
       !read.includes('CANARY'), read.slice(0, 60))
   }
   await evalJs(`(() => { document.getElementById('e2e34frame')?.remove(); return 1 })()`)
+  }
 } finally {
-  if (envBackup === null) { try { unlinkSync(ENV_FILE) } catch { /* gone */ } }
-  else writeFileSync(ENV_FILE, envBackup)
+  await fixture.restore()
   try { unlinkSync(CANARY) } catch { /* gone */ }
   ws.close()
 }

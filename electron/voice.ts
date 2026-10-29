@@ -5,8 +5,8 @@
 // it loads whisper large-v3 AND a CTC aligner onto a 6 GB card, and two of them
 // at once would simply run out of memory.
 //
-// The driver's path is listed in claude.ts's stale-process sweep: an orphan
-// holds several GB of VRAM and the next run would OOM behind it.
+// An orphan can hold several GB of VRAM. Keep this module's child lifecycle
+// explicit; the agent ownership registry no longer kills workers by path matches.
 import { app, ipcMain, BrowserWindow } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import { promises as fs } from 'fs'

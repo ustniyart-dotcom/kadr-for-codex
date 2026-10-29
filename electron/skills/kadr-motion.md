@@ -1,6 +1,6 @@
 ---
 name: kadr-motion
-description: Motion graphics in Kadr — titles, captions, callouts, promos, multi-scene fragment pieces. Readability rules with numbers, style defaults that keep work from looking AI-templated, the one-film architecture for pieces made of several fragments, and the checks (kadr_check, kadr_sheet) to run before showing anything. Use together with kadr-editor whenever you write or change a fragment, a title or captions; add kadr-music when there is music and kadr-3d for 3D.
+description: Create and verify titles, captions and Remotion motion graphics in an open Kadr project. Use with kadr-editor and connected Kadr tools; add kadr-music for rhythmic work and kadr-3d for models.
 ---
 <!-- managed by Kadr: rewritten when Kadr updates (electron/skills/) -->
 

@@ -1,5 +1,5 @@
 // Test: autosave (writes <name>.autosave.kadr next to the project, skips
-// while exporting/Claude is active, skips unchanged) and auto-captions
+// while exporting is active, keeps saving with the assistant open, skips unchanged) and auto-captions
 // (generated caption fragment from synthetic word cues, live overlay,
 // mouse gizmo moves/scales the clip transform).
 import WebSocket from 'ws'
@@ -125,13 +125,20 @@ const as = await evalJs(`(async () => {
   await ed.autosaveNow()
   const after3 = await window.kadr.statFile('/tmp/kadr-test/as/proj.autosave.kadr')
   const restored = JSON.parse(await window.kadr.readTextFile('/tmp/kadr-test/as/proj.autosave.kadr'))
+  st().updateClip(st().project.tracks.flatMap(t => t.clips)[0].id, { label: 'assistant-open' })
+  ed.activity.claude = true
+  await ed.autosaveNow()
+  ed.activity.claude = false
+  const withAssistant = JSON.parse(await window.kadr.readTextFile('/tmp/kadr-test/as/proj.autosave.kadr'))
   return { after1, same: after2 === after1, skipped: during === after1,
-           rewritten: after3 > after1, label: restored.tracks.flatMap(t=>t.clips)[0].label }
+           rewritten: after3 > after1, label: restored.tracks.flatMap(t=>t.clips)[0].label,
+           assistantLabel: withAssistant.tracks.flatMap(t=>t.clips)[0].label }
 })()`)
 check('autosave writes <name>.autosave.kadr next to the project', as.after1 !== null)
 check('unchanged project is not rewritten', as.same === true)
 check('autosave skipped while exporting, written after', as.skipped && as.rewritten && as.label === 'touched',
   JSON.stringify({ skipped: as.skipped, rewritten: as.rewritten, label: as.label }))
+check('an open assistant panel does not suspend autosave', as.assistantLabel === 'assistant-open')
 
 // ---- auto captions (synthetic cues, no speech needed) ----------------------
 const cap = await evalJs(`(async () => {

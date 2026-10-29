@@ -6,15 +6,16 @@
 //     use the asset, cascade removal (linked twin included), single undo;
 //  3) unlimited clip speed with snap during Ctrl-drag (old 0.25–4 clamp gone);
 //  4) playbackRate clamp — playback keeps running at speed 30;
-//  5) Claude panel: rect restored from localStorage, header drag moves it,
+//  5) Codex panel: rect restored from localStorage, header drag moves it,
 //     corner resize works, both persisted.
 import WebSocket from 'ws'
 import { execFileSync } from 'child_process'
-import { readFileSync, writeFileSync, unlinkSync } from 'fs'
+import { readFileSync } from 'fs'
 import { createServer } from 'http'
+import { assertIsolatedEditor, installAgentFixture, requireIsolatedUserData } from './e2e-agent-fixture.mjs'
 
 const PORT = process.env.KADR_CDP_PORT || 9777
-const ENV_FILE = `${process.env.HOME}/.config/kadr/claude-env.json`
+const USER_DATA = requireIsolatedUserData()
 
 // self-contained media: video+audio, video-only, image, audio-only
 execFileSync('bash', ['-c',
@@ -83,6 +84,7 @@ function check(name, cond, extra = '') {
 
 ws = new WebSocket(await getPageWs())
 await new Promise((r, j) => { ws.on('open', r); ws.on('error', j) })
+await assertIsolatedEditor(evalJs)
 
 // protect the user's live work before reloading
 try {
@@ -91,7 +93,7 @@ try {
     if (!st) return 'no-store'
     const clips = st.project.tracks.reduce((n, t) => n + t.clips.length, 0)
     if (!clips) return 'empty'
-    const p = '${process.env.HOME}/Downloads/autosave-' + Date.now() + '.kadr'
+    const p = ${JSON.stringify(USER_DATA + '/autosave-')} + Date.now() + '.kadr'
     await window.kadr.writeProject(p, st.project)
     return p
   })()`, { timeout: 15000 })
@@ -342,17 +344,9 @@ const play = await evalJs(`(async () => {
 check('playback at ×30 runs without tick errors (playbackRate clamped)',
   play.advanced && play.tickErrors === 0, JSON.stringify(play))
 
-// ---- 5. Claude panel: restore, drag, resize, persist -------------------------
-let envBackup = null
-let envWritten = false
-try { envBackup = readFileSync(ENV_FILE, 'utf8') } catch { /* none */ }
-// a leftover test override from a crashed run is NOT the user's config —
-// restoring it would silently turn the user's Claude panel into plain bash
-if (envBackup !== null && /"command"\s*:\s*"bash"/.test(envBackup)) envBackup = null
+// ---- 5. Codex panel: restore, drag, resize, persist --------------------------
+const fixture = await installAgentFixture(evalJs)
 try {
-  writeFileSync(ENV_FILE, JSON.stringify({ command: 'bash', args: [] }))
-  envWritten = true
-
   const panel = await evalJs(`(async () => {
     localStorage.setItem('kadr.claudeRect', JSON.stringify({ x: 80, y: 90, w: 520, h: 400 }))
     const btn = document.querySelector('.claude-btn')
@@ -404,10 +398,7 @@ try {
     Math.abs(resized.h - 430) < 2 && Math.abs(resized.saved.w - 570) < 2 && resized.closed,
     JSON.stringify(resized))
 } finally {
-  if (envWritten) {
-    if (envBackup !== null) writeFileSync(ENV_FILE, envBackup)
-    else { try { unlinkSync(ENV_FILE) } catch { /* gone */ } }
-  }
+  await fixture.restore()
 }
 
 // ---- 6. browser-style drop: an image URL, no files --------------------------

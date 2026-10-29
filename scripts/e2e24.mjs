@@ -4,11 +4,12 @@
 // composites the fragment over a video, MCP exposes kadr_fragment_create.
 // Requires the workspace to be installed (first fragmentEnsure run).
 import WebSocket from 'ws'
-import { spawn, execFileSync } from 'child_process'
+import { execFileSync } from 'child_process'
 import { writeFileSync, unlinkSync, readFileSync, existsSync, readdirSync } from 'fs'
+import { assertIsolatedEditor, installAgentFixture, requireIsolatedUserData } from './e2e-agent-fixture.mjs'
 
 const PORT = process.env.KADR_CDP_PORT || 9777
-const ENV_FILE = `${process.env.HOME}/.config/kadr/claude-env.json`
+const USER_DATA = requireIsolatedUserData()
 
 // self-contained media: the export check counts smpte-bar pixels below the fragment
 execFileSync('bash', ['-c',
@@ -77,6 +78,7 @@ execFileSync('bash', ['-c',
 
 ws = new WebSocket(await getPageWs())
 await new Promise((r, j) => { ws.on('open', r); ws.on('error', j) })
+await assertIsolatedEditor(evalJs)
 
 try {
   const saved = await evalJs(`(async () => {
@@ -84,7 +86,7 @@ try {
     if (!st) return 'no-store'
     const clips = st.project.tracks.reduce((n, t) => n + t.clips.length, 0)
     if (!clips) return 'empty'
-    const p = '${process.env.HOME}/Downloads/autosave-' + Date.now() + '.kadr'
+    const p = ${JSON.stringify(USER_DATA + '/autosave-')} + Date.now() + '.kadr'
     await window.kadr.writeProject(p, st.project)
     return p
   })()`, { timeout: 15000 })
@@ -101,8 +103,7 @@ for (let i = 0; i < 30; i++) {
 }
 
 let fragId = null
-let envBackup = null
-let envWritten = false
+let fixture = null
 try {
   // 1) create a short fragment over [1, 2)
   const created = await evalJs(`(async () => {
@@ -136,7 +137,7 @@ try {
   check('preview overlay iframe is live', overlay.ok === true && overlay.src.includes(fragId),
     overlay.src ?? '')
 
-  // 3) hot edit survives (Claude's loop): rewrite the entry, overlay stays
+  // 3) hot edit survives the assistant's loop: rewrite the entry, overlay stays
   const entrySrc = readFileSync(created.entry, 'utf8')
   writeFileSync(created.entry, entrySrc.replace('e2e-frag', 'HOT-OK'))
   const afterEdit = await evalJs(`(async () => {
@@ -155,7 +156,7 @@ try {
   // parses. So while the render runs, the cache path must stay empty and the
   // bytes must land in a `.part.` sidecar; the final name appears only on
   // success.
-  const RENDER_DIR = `${process.env.HOME}/.config/kadr/fragment-renders`
+  const RENDER_DIR = `${USER_DATA}/fragment-renders`
   const partsOf = () => readdirSync(RENDER_DIR).filter(
     (f) => f.startsWith(fragId) && f.includes('.part.'))
   const finalOf = () => readdirSync(RENDER_DIR).filter(
@@ -224,12 +225,9 @@ print(bars, text)
     px[0] > 200 && px[1] > 30, `bar-px=${px[0]} text-px=${px[1]}`)
 
   // 6) MCP exposes the fragment tool
-  try { envBackup = readFileSync(ENV_FILE, 'utf8') } catch { /* none */ }
-  writeFileSync(ENV_FILE, JSON.stringify({ command: 'bash', args: [] }))
-  envWritten = true
+  fixture = await installAgentFixture(evalJs)
   const opened = await evalJs(`(async () => window.kadr.claudeOpen(80, 24, null))()`)
-  const mcp = spawn('node', ['electron/mcp-bridge.cjs', String(opened.port)],
-    { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'inherit'] })
+  const mcp = await fixture.startMcp(opened.port)
   const pending = new Map()
   let buf = ''
   mcp.stdout.on('data', (d) => {
@@ -251,8 +249,8 @@ print(bars, text)
   let mcpId = 0
   const mcpCall = (method, params) => new Promise((resolve, reject) => {
     const i = ++mcpId
-    pending.set(i, resolve)
-    setTimeout(() => { if (pending.has(i)) { pending.delete(i); reject(new Error(method + ' timeout')) } }, 30000)
+    const timer = setTimeout(() => { if (pending.has(i)) { pending.delete(i); reject(new Error(method + ' timeout')) } }, 30000)
+    pending.set(i, (result) => { clearTimeout(timer); resolve(result) })
     mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: i, method, params }) + '\n')
   })
   await mcpCall('initialize', {
@@ -265,10 +263,7 @@ print(bars, text)
   mcp.kill()
   await evalJs(`(async () => window.kadr.claudeClose())()`)
 } finally {
-  if (envWritten) {
-    if (envBackup !== null) writeFileSync(ENV_FILE, envBackup)
-    else try { unlinkSync(ENV_FILE) } catch { /* absent */ }
-  }
+  await fixture?.restore()
   if (fragId) {
     await evalJs(`(async () => window.kadrEditor.deleteFragment(${JSON.stringify(fragId)}))()`)
       .catch(() => { /* best effort */ })

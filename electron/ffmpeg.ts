@@ -624,6 +624,11 @@ export class RawVideoEncoder {
   }) {
     const child = spawn(FFMPEG, rawEncodeArgs(opts), { stdio: ['pipe', 'ignore', 'pipe'] })
     this.child = child
+    this.err = ''
+    // A failed/cancelled encoder closes the pipe while a frame is queued.
+    // The write callback below rejects it; consume the accompanying stream
+    // error too, otherwise EPIPE is an uncaught event in the main process.
+    child.stdin!.on('error', () => { /* reported by write/finish */ })
     child.stderr!.on('data', (c) => { this.err += c })
     this.closed = new Promise((resolve, reject) => {
       child.on('error', reject)
@@ -643,8 +648,10 @@ export class RawVideoEncoder {
         reject(new Error(`raw encoder gone: ${this.err.slice(0, 300)}`))
         return
       }
-      if (stdin.write(data)) resolve()
-      else stdin.once('drain', resolve)
+      // `drain` need not happen when ffmpeg exits under backpressure. The
+      // callback settles on both a flushed frame and a broken pipe, and only
+      // releases the caller's buffer once the stream has finished using it.
+      stdin.write(data, (err) => (err ? reject(err) : resolve()))
     })
   }
 

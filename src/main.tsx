@@ -41,6 +41,7 @@ import { detectBeats, clearBeats, beatTimes, useBeatsUi } from './engine/beats'
 import { bakeAudio, bakeState, bakePlan, refreshStaleBakes } from './engine/audioReact'
 import { loadSoundLibrary, findSfx, addSound, setSoundMeta, sfxFamilies, SFX_FAMILIES, SFX_USES } from './engine/sounds'
 import { useSoundsUi } from './components/SoundsDialog'
+import { agentContextKey } from '@shared/agentContext'
 
 wireLog()   // first: everything below may want to report a failure
 wireProxies()
@@ -66,10 +67,14 @@ wireOnion()
   void window.kadr.gpuReport?.(name).then((mode) => logInfo('видеокарта', `${name} (${mode === 'discrete' ? 'дискретная' : 'по умолчанию'})`))
 }
 
-// Scripting surface for automation and AI integration (Claude Code / MCP):
+// Scripting surface for automation and AI integration (Codex / MCP):
 // every editor operation is reachable from here.
 ;(window as any).kadrEditor = {
   useEditor, useSettings, usePosePresets, useFxPresets, projectDuration, uid, newClipDefaults,
+  agentContextKey: () => {
+    const state = useEditor.getState()
+    return agentContextKey(state.project.id, state.projectPath)
+  },
   PRESETS, startExport, evalAnim, openProject: openProjectAt,
   transcribe: transcribeFlow, parseSrt, cuesToSrt, docTimeToProject, segmentsToCues,
   createFragment, ensureFragmentServer, deleteFragment, fragmentNeedsCapture, autoCaptions, captionsTsx, autosaveNow, activity,

@@ -2,12 +2,11 @@
 // (VAD must yield zero hallucinated cues, files still written and registered
 // as project texts), SRT round-trip, and the kadr_transcribe MCP tool.
 import WebSocket from 'ws'
-import { spawn, execFileSync } from 'child_process'
-import { writeFileSync, unlinkSync, readFileSync } from 'fs'
+import { execFileSync } from 'child_process'
+import { assertIsolatedEditor, installAgentFixture, requireIsolatedUserData } from './e2e-agent-fixture.mjs'
 
 const PORT = process.env.KADR_CDP_PORT || 9777
-const ENV_FILE = `${process.env.HOME}/.config/kadr/claude-env.json`
-const GEN_FILE = `${process.env.HOME}/.config/kadr/kadr-mcp.json`
+const USER_DATA = requireIsolatedUserData()
 
 async function getPageWs() {
   for (let i = 0; i < 30; i++) {
@@ -72,6 +71,7 @@ execFileSync('bash', ['-c',
 
 ws = new WebSocket(await getPageWs())
 await new Promise((r, j) => { ws.on('open', r); ws.on('error', j) })
+await assertIsolatedEditor(evalJs)
 
 try {
   const saved = await evalJs(`(async () => {
@@ -79,7 +79,7 @@ try {
     if (!st) return 'no-store'
     const clips = st.project.tracks.reduce((n, t) => n + t.clips.length, 0)
     if (!clips) return 'empty'
-    const p = '${process.env.HOME}/Downloads/autosave-' + Date.now() + '.kadr'
+    const p = ${JSON.stringify(USER_DATA + '/autosave-')} + Date.now() + '.kadr'
     await window.kadr.writeProject(p, st.project)
     return p
   })()`, { timeout: 15000 })
@@ -175,15 +175,10 @@ check('range flow: files written, relative offset recorded',
   JSON.stringify(rangeRes))
 
 // the MCP server exposes kadr_transcribe
-let envBackup = null
-try { envBackup = readFileSync(ENV_FILE, 'utf8') } catch { /* none */ }
-writeFileSync(ENV_FILE, JSON.stringify({ command: 'bash', args: [] }))
+const fixture = await installAgentFixture(evalJs)
 try {
   const opened = await evalJs(`(async () => window.kadr.claudeOpen(80, 24, null))()`)
-  // the /eval bridge is locked with a per-session token (argv[3] of the generated mcp-config)
-  const TOKEN = JSON.parse(readFileSync(GEN_FILE, 'utf8')).mcpServers.kadr.args?.[2]
-  const mcp = spawn('node', ['electron/mcp-bridge.cjs', String(opened.port), TOKEN],
-    { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'inherit'] })
+  const mcp = await fixture.startMcp(opened.port)
   const pending = new Map()
   let buf = ''
   mcp.stdout.on('data', (d) => {
@@ -205,8 +200,8 @@ try {
   let mcpId = 0
   const mcpCall = (method, params) => new Promise((resolve, reject) => {
     const i = ++mcpId
-    pending.set(i, resolve)
-    setTimeout(() => { if (pending.has(i)) { pending.delete(i); reject(new Error(method + ' timeout')) } }, 120000)
+    const timer = setTimeout(() => { if (pending.has(i)) { pending.delete(i); reject(new Error(method + ' timeout')) } }, 120000)
+    pending.set(i, (result) => { clearTimeout(timer); resolve(result) })
     mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: i, method, params }) + '\n')
   })
   await mcpCall('initialize', {
@@ -228,8 +223,7 @@ try {
   mcp.kill()
   await evalJs(`(async () => window.kadr.claudeClose())()`)
 } finally {
-  if (envBackup !== null) writeFileSync(ENV_FILE, envBackup)
-  else try { unlinkSync(ENV_FILE) } catch { /* absent */ }
+  await fixture.restore()
 }
 
 ws.close()

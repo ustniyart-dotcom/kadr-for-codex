@@ -1,16 +1,13 @@
-// Test: embedded Claude Code integration — PTY terminal session (with a
-// safe `bash` override instead of the real claude), the editor HTTP bridge,
+// Test: embedded Codex integration — PTY terminal session (with an
+// offline fake CLI instead of a real model), the editor HTTP bridge,
 // and the MCP stdio server end-to-end (initialize → tools/list → kadr_state
 // → kadr_eval mutation with undo entry).
 import WebSocket from 'ws'
-import { spawn } from 'child_process'
-import { writeFileSync, unlinkSync, readFileSync } from 'fs'
 import http from 'http'
+import { assertIsolatedEditor, bridgeArgs, installAgentFixture, requireIsolatedUserData } from './e2e-agent-fixture.mjs'
 
 const PORT = process.env.KADR_CDP_PORT || 9777
-const ENV_FILE = `${process.env.HOME}/.config/kadr/claude-env.json`
-const MCP_FILE = `${process.env.HOME}/.config/kadr/claude-mcp.json`
-const GEN_FILE = `${process.env.HOME}/.config/kadr/kadr-mcp.json`
+requireIsolatedUserData()
 
 async function getPageWs() {
   for (let i = 0; i < 30; i++) {
@@ -71,20 +68,8 @@ function check(name, cond, extra = '') {
 ws = new WebSocket(await getPageWs())
 await new Promise((r, j) => { ws.on('open', r); ws.on('error', j) })
 
-// safe override: the "claude" session is a plain interactive bash
-let envBackup = null
-try { envBackup = readFileSync(ENV_FILE, 'utf8') } catch { /* none */ }
-// a leftover test override from a crashed run is NOT the user's config —
-// restoring it would silently turn the user's Claude panel into plain bash
-if (envBackup !== null && /"command"\s*:\s*"bash"/.test(envBackup)) envBackup = null
-writeFileSync(ENV_FILE, JSON.stringify({ command: 'bash', args: [] }))
-// user MCP servers from claude-mcp.json must merge into the generated config
-let mcpBackup = null
-try { mcpBackup = readFileSync(MCP_FILE, 'utf8') } catch { /* none */ }
-if (mcpBackup !== null && mcpBackup.includes('e2e-extra')) mcpBackup = null
-writeFileSync(MCP_FILE, JSON.stringify({
-  mcpServers: { 'e2e-extra': { command: 'true', args: [] } }
-}))
+await assertIsolatedEditor(evalJs)
+const fixture = await installAgentFixture(evalJs)
 
 try {
   // give the page a name marker to read back through the bridges
@@ -101,27 +86,26 @@ try {
     const r = await window.kadr.claudeOpen(100, 30, null)
     return r
   })()`)
-  check('terminal session opens (bash override)', opened.ok === true && opened.port > 0,
+  check('terminal session opens (offline fake Codex)', opened.ok === true && opened.port > 0,
     JSON.stringify(opened))
 
-  // generated --mcp-config = user's extra servers + kadr (kadr wins clashes)
-  const gen = JSON.parse(readFileSync(GEN_FILE, 'utf8'))
-  check('claude-mcp.json servers merge into the generated mcp-config',
-    !!gen.mcpServers['e2e-extra'] && !!gen.mcpServers.kadr &&
-    gen.mcpServers.kadr.args?.[1] === String(opened.port),
-    Object.keys(gen.mcpServers).join(','))
+  const capture = await fixture.capture(opened.port)
+  check('Codex receives the session-scoped MCP overlay',
+    capture.argv.includes('--no-daemon') && bridgeArgs(capture.argv)[1] === String(opened.port))
+  check('Codex launch does not supply a permissions bypass',
+    !capture.argv.some((arg) => /dangerously-bypass|yolo|skip-permissions/.test(arg)))
 
   // /eval runs arbitrary JS in the page, which holds window.kadr (file writes,
   // pty spawn), so the socket carries a per-session secret handed to the MCP
-  // server through this very config
-  const TOKEN = gen.mcpServers.kadr.args?.[2]
-  check('the bridge hands the MCP server a per-session token',
-    typeof TOKEN === 'string' && TOKEN.length >= 32, `len=${TOKEN?.length}`)
+  // server through an environment variable, never a command argument.
+  const TOKEN = capture.token
+  check('the session token is in the environment and absent from command arguments',
+    typeof TOKEN === 'string' && TOKEN.length >= 32 && !capture.argv.some((arg) => arg.includes(TOKEN)))
 
   const echoed = await evalJs(`(async () => {
-    window.kadr.claudeInput('echo KADR_$((40+2))\\n')
+    window.kadr.claudeInput('KADR_42\\n')
     await new Promise(r => setTimeout(r, 1200))
-    return window.__cl.includes('KADR_42')
+    return window.__cl.includes('KADR_E2E_ECHO:KADR_42')
   })()`)
   check('pty round-trip works (typed command echoes back)', echoed === true)
 
@@ -165,8 +149,7 @@ try {
     `status=${fromPage.status}`)
 
   // 3) MCP stdio server: handshake + tools + live state + mutation
-  const mcp = spawn('node', ['electron/mcp-bridge.cjs', String(opened.port), TOKEN],
-    { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'inherit'] })
+  const mcp = await fixture.startMcp(opened.port)
   const pending = new Map()
   let buf = ''
   mcp.stdout.on('data', (d) => {
@@ -188,8 +171,8 @@ try {
   let mcpId = 0
   const mcpCall = (method, params) => new Promise((resolve, reject) => {
     const i = ++mcpId
-    pending.set(i, resolve)
-    setTimeout(() => { if (pending.has(i)) { pending.delete(i); reject(new Error(method + ' timeout')) } }, 20000)
+    const timer = setTimeout(() => { if (pending.has(i)) { pending.delete(i); reject(new Error(method + ' timeout')) } }, 20000)
+    pending.set(i, (result) => { clearTimeout(timer); resolve(result) })
     mcp.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: i, method, params }) + '\n')
   })
 
@@ -258,11 +241,8 @@ try {
   })
   check('closing the session kills pty and bridge port', closed === true && portDead === true)
 } finally {
-  if (envBackup !== null) writeFileSync(ENV_FILE, envBackup)
-  else try { unlinkSync(ENV_FILE) } catch { /* absent */ }
-  if (mcpBackup !== null) writeFileSync(MCP_FILE, mcpBackup)
-  else try { unlinkSync(MCP_FILE) } catch { /* absent */ }
+  await fixture.restore()
+  ws.close()
 }
 
-ws.close()
 console.log('e2e22 finished')

@@ -1,6 +1,6 @@
 ---
 name: kadr-music
-description: Music in a Kadr project — the music map (kadr_beats: meter, the "one" of every bar, sections, pauses, kick offset), cutting and animating to a bar hierarchy (accentAt/useAccent/breathAt in a fragment's audio.ts), and sound design (kadr_sounds, kadr_sound_add; mechanical sounds under songs). Use together with kadr-editor whenever the open Kadr project has music or the user wants anything timed to a beat; combine with kadr-motion and kadr-3d as the project needs.
+description: Build music maps, beat-aligned cuts and sound design in an open Kadr project. Use with kadr-editor when connected Kadr tools can analyse music, place sounds or animate fragments to a beat.
 ---
 <!-- managed by Kadr: rewritten when Kadr updates (electron/skills/) -->
 
@@ -24,7 +24,8 @@ grid for a 4/4 feel, and that effects under a song with vocals fight it.
 
 Before you cut, time or animate anything over music, run `kadr_beats` on the
 music clip (`clipIds`) — not on the whole mix when a voice-over runs on top.
-Then SHOW the user the map and get a yes before building:
+Explain the useful parts of the map, then continue within the approved brief.
+Ask for a decision only if an uncertain beat or structure changes the edit:
 
 - tempo and meter (`meter`, `meterConfidence`);
 - which beat is the "one" (`phaseConfidence` — below ~0.2, say so and ask them

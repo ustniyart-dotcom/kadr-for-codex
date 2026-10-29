@@ -10,7 +10,7 @@ import {
 } from './ffmpeg'
 import { mediaCacheKey, proxySuffix, decodedSuffix, reverseSuffix } from './cacheKeys'
 import { registerStorageIpc } from './storage'
-import { registerClaudeIpc } from './claude'
+import { registerAgentIpc } from './agent'
 import { registerTranscribeIpc } from './transcribe'
 import { registerTtsIpc } from './tts'
 import { registerVoiceIpc } from './voice'
@@ -36,10 +36,9 @@ protocol.registerSchemesAsPrivileged([
   }
 ])
 
-// A second, isolated instance (a test bench next to a working editor) needs
-// its own userData — its caches, stores and, above all, its startup sweep
-// (sweepStaleSessions matches helper processes by paths under userData) must
-// never reach the other instance's. Must run before anything reads the path.
+// A test bench next to a working editor needs its own caches, stores and
+// agent ownership records. This must run before anything reads userData.
+// Tests also set KADR_AGENT_SKILLS_DIR to isolate skill installation.
 if (process.env.KADR_USER_DATA) app.setPath('userData', process.env.KADR_USER_DATA)
 
 // the discrete GPU when there is one (electron/gpu.ts) — before 'ready'
@@ -267,7 +266,7 @@ app.whenReady().then(() => {
   registerIpc()
   void pruneDecodedCache()
   void sweepPartFiles()
-  registerClaudeIpc(() => win)
+  registerAgentIpc(() => win)
   registerTranscribeIpc(() => win)
   registerTtsIpc(() => win)
   registerVoiceIpc(() => win)

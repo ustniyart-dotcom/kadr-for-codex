@@ -1,16 +1,20 @@
-# Kadr
+# Kadr for Codex
 
-**AI-native, GPU-accelerated video editor — with Claude Code built into the timeline.**
+**AI-native, GPU-accelerated video editor — with Codex built into the timeline.**
 
 [Русская версия →](README.md) · [Full feature guide (RU) →](FEATURES.md) · [Video →](https://www.youtube.com/watch?v=1RKRtRgzE24)
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL_3.0-blue.svg)](LICENSE)
 
+A fork of [HelpFreedom/kadr](https://github.com/HelpFreedom/kadr) adapted for
+Codex, including Codex sign-in with ChatGPT. Upstream authorship, the media
+engine and GPL-3.0 license are retained. [Setup and integration boundaries →](docs/codex.md)
+
 ![Kadr demo](demo.gif)
 
 Kadr is a multi-track video editor (Electron + React + TypeScript) built
 around one idea: *an AI agent should be able to edit video next to you, on
-the same timeline, with the same tools.* Press “Claude”, type “add animated
+the same timeline, with the same tools.* Press “Codex”, type “add animated
 captions to this part”, watch it happen live in the preview.
 
 ## Highlights
@@ -160,17 +164,17 @@ captions to this part”, watch it happen live in the preview.
 - 🪟 **Alpha video** — transparent WebM (VP8/VP9+alpha), MOV (ProRes 4444)
   and HEVC with alpha keep their transparency in both preview and export:
   lower tracks show through, masks and effects behave as usual.
-- 🤖 **Embedded Claude Code** — a real interactive Claude session in a
+- 🤖 **Embedded Codex** — a real interactive Codex session in a
   terminal panel, wired to the live project over MCP: it reads the
   timeline, edits clips, transcribes, creates and iterates Remotion
   fragments while you watch the preview update. The panel is draggable,
   resizable and remembers its place across launches. Its skills are
   **composable** — a base plus music, motion and 3D, loaded as the project
-  needs; their rules are defaults (questions and a storyboard first, no
-  template tricks, a multi-scene piece is one film), your words win.
+  needs. They reuse the agreed brief and verify results with frames and
+  timings; your requirements take precedence over style defaults.
 - 📍 **Timeline markers** — press **M** to drop a numbered marker at the
   playhead: drag it, right-click to remove it, it lives in the project
-  file and the embedded Claude can see and place them too ("retime
+  file and the embedded Codex can see and place them too ("retime
   everything between marker 3 and marker 4").
 - 📤 **Uncompromised export** — video is encoded by ffmpeg x264 at the
   preset's true bitrate (Chromium's built-in encoder ignored the bitrate
@@ -189,23 +193,22 @@ captions to this part”, watch it happen live in the preview.
   fragments now exports in **13 minutes instead of hours** (58 fps at
   1080p60).
 - 🛟 **Quality-of-life** — background 540p preview proxies, autosave every
-  5 minutes (atomic, skipped during exports/AI sessions), an
-  unsaved-changes indicator with “✓ Saved” feedback, self-healing after
-  hard closes (no lingering processes), effect & pose presets shared
+  5 minutes (atomic, remains active with the Codex panel open), an
+  unsaved-changes indicator with “✓ Saved” feedback, verified orphaned
+  Codex session cleanup, effect & pose presets shared
   across projects, RU/EN interface.
-- 🔒 **Clean `npm audit`** — Electron 42 / Chromium 148, vite 7, fresh
-  tar: 0 known vulnerabilities in the dependency tree (thanks to
-  [@Antony-hash512](https://github.com/Antony-hash512) for
-  [issue #1](https://github.com/HelpFreedom/kadr/issues/1)).
+- 🔒 **Dependency checks** — the lockfile is patched within existing major
+  versions; `npm audit` on 2026-10-29 reports 0 advisories.
+  `npm run verify` checks types, MCP, agent lifecycle and the production build.
 
 ## Requirements
 
 | Component | Needed for | Notes |
 |---|---|---|
-| Node.js ≥ 20 | everything | |
+| Node.js ≥ 22.12 | everything | |
 | ffmpeg + ffprobe | import, audio mix, export | any recent build in PATH |
 | python3 + [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | speech-to-text, auto-captions | `pip install faster-whisper`; models download on first use |
-| [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) | the “Claude” panel | optional; uses your existing login |
+| [Codex CLI](https://developers.openai.com/codex/cli) | the “Codex” panel | optional; uses your existing login |
 | network (one-time) | Remotion fragments workspace | `~/kadr-fragments`, ~150 MB |
 | an [ElevenLabs](https://elevenlabs.io) key | voice-over | optional; entered in the voice-over settings and kept outside the project |
 | python ≥ 3.11 with torch | voice-over defect detection | optional; the interpreter is a setting, and without it the module degrades to plain voice-over instead of breaking |
@@ -213,14 +216,15 @@ captions to this part”, watch it happen live in the preview.
 ## Getting started
 
 ```bash
-git clone https://github.com/HelpFreedom/kadr.git && cd kadr
-npm install        # postinstall rebuilds node-pty for Electron
+git clone https://github.com/ustniyart-dotcom/kadr-for-codex.git
+cd kadr-for-codex
+npm ci             # postinstall rebuilds node-pty for Electron
 npm run dev
 ```
 
-Import media, edit, press Export. For the AI assistant press “Claude”
-in the topbar (the `claude` CLI must be installed and logged in). If your network needs a
-proxy for Claude/npm, create `~/.config/kadr/claude-env.json`:
+Import media, edit, press Export. For the AI assistant press “Codex”
+in the topbar (the `codex` CLI must be installed and logged in). If your network needs a
+proxy for Codex/npm, create `~/.config/kadr/codex-env.json`:
 
 ```json
 { "env": { "HTTPS_PROXY": "http://127.0.0.1:1080", "NO_PROXY": "127.0.0.1,localhost" } }
@@ -228,7 +232,7 @@ proxy for Claude/npm, create `~/.config/kadr/claude-env.json`:
 
 ## How the AI integration works
 
-Kadr starts a local HTTP bridge into the renderer and hands Claude an MCP
+Kadr starts a local HTTP bridge into the renderer and hands Codex an MCP
 server with its own set of tools:
 
 | Tool | What it does |
@@ -255,13 +259,20 @@ server with its own set of tools:
 | `kadr_voice_regenerate` | regenerate the confirmed phrases (only those) |
 | `kadr_voice_learn` | report the labelled corpus, and retrain only on explicit confirmation |
 
-The killer loop: Claude creates a fragment, edits its TSX with normal file
+The killer loop: Codex creates a fragment, edits its TSX with normal file
 tools, and vite hot-reloads it into your preview in ~2 seconds — you give
 feedback in plain language, no rendering until the final export.
 
 ## Testing
 
-E2E tests drive the real app over the Chrome DevTools Protocol:
+```bash
+npm run verify       # types, portable regressions, production build
+npm run test:media   # additional FFmpeg checks
+```
+
+E2E tests drive the real app over the Chrome DevTools Protocol.
+Use a blank project and isolated `KADR_USER_DATA` / `KADR_AGENT_SKILLS_DIR`
+directories; see the [test setup](docs/codex.md#проверки).
 
 ```bash
 npx electron-vite dev -- --remote-debugging-port=9777   # terminal 1
@@ -301,14 +312,19 @@ node scripts/check-timeline.mjs   # timeline waveform and overlaps — exactly a
 ## Documentation
 
 - [FEATURES.md](FEATURES.md) — the full feature guide (Russian, 2200+ lines).
-- [CLAUDE.md](CLAUDE.md) — architecture map (also read by Claude Code).
+- [AGENTS.md](AGENTS.md) — concise Codex development instructions.
+- [docs/architecture.md](docs/architecture.md) — detailed architecture map.
+- [docs/codex.md](docs/codex.md) — Codex setup and ChatGPT host boundaries (RU).
+- [docs/audit-2026-10-29.md](docs/audit-2026-10-29.md) — audit and changes (RU).
 
 ## Authors
 
-- **Black Triangle** — repository owner: direction, acceptance, and all of
+- **Black Triangle** — original Kadr author: direction, acceptance, and all of
   the editing and audio expertise behind the features.
 - **Claude** (Anthropic) — pair development: implementation, measurements,
   tests, and this documentation.
+
+Codex fork: [ustniyart-dotcom/kadr-for-codex](https://github.com/ustniyart-dotcom/kadr-for-codex).
 
 ## License
 

@@ -36,11 +36,11 @@ function loadRect(): PanelRect | null {
 }
 
 /**
- * Embedded Claude Code session: an xterm terminal driven by a PTY in the
- * main process running the user's `claude` CLI, with the kadr MCP server
+ * Embedded Codex session: an xterm terminal driven by a PTY in the
+ * main process running the user's `codex` CLI, with the kadr MCP server
  * wired to this very editor instance. Closing the panel kills the session.
  */
-export function ClaudePanel({ onClose }: { onClose: () => void }) {
+export function AgentPanel({ onClose }: { onClose: () => void }) {
   const t = useT()
   const holder = useRef<HTMLDivElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
@@ -135,6 +135,8 @@ export function ClaudePanel({ onClose }: { onClose: () => void }) {
       } else {
         term.focus()
       }
+    }).catch((err) => {
+      if (!dead) term.write(`\x1b[31m${t('claudeFailed')}: ${String(err)}\x1b[0m\r\n`)
     })
     term.focus()
 
@@ -145,7 +147,7 @@ export function ClaudePanel({ onClose }: { onClose: () => void }) {
       onData.dispose()
       offData()
       offExit()
-      window.kadr.claudeClose()
+      void window.kadr.claudeClose().catch(() => undefined)
       term.dispose()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -160,7 +162,7 @@ export function ClaudePanel({ onClose }: { onClose: () => void }) {
         : undefined}
     >
       <div className="claude-head" onPointerDown={startMove}>
-        <span><Icon name="bot" size={15} /> Claude Code</span>
+        <span><Icon name="bot" size={15} /> Codex</span>
         <span className="dim claude-hint">{t('claudeHint')}</span>
         <button
           className="claude-close"

@@ -1,7 +1,7 @@
 // Autosave: every 5 minutes a changed project is written to
 // <name>.autosave.kadr next to the saved file (Downloads when never saved).
-// Paused while an export runs or an embedded Claude session is open — those
-// must never compete for the disk or snapshot a mid-mutation project.
+// Paused during exports and the voice detector. Merely keeping the assistant
+// panel open must not disable crash recovery for a whole editing session.
 import type { Project } from '@shared/types'
 import { useEditor } from '@/state/store'
 import { logWarn } from './log'
@@ -11,25 +11,36 @@ export const activity = {
   exporting: false,
   /** the defect detector holds the GPU for minutes */
   voiceCheck: false,
+  /** Legacy panel state; an open terminal does not suspend autosave. */
   claude: false
 }
 
 const INTERVAL_MS = 5 * 60 * 1000
 
 let lastSnapshot: Project | null = null
+let lastPath: string | null = null
+let saving = false
 
 async function tick() {
-  if (activity.exporting || activity.claude || activity.voiceCheck) return
+  if (saving || activity.exporting || activity.voiceCheck) return
   const s = useEditor.getState()
-  if (s.project === lastSnapshot) return // nothing changed since the last write
+  // Save As changes the recovery destination without changing the project.
+  if (s.project === lastSnapshot && s.projectPath === lastPath) return
   const clips = s.project.tracks.reduce((n, t) => n + t.clips.length, 0)
   if (!clips && !(s.project.texts?.length)) return // nothing worth keeping
+  saving = true
   try {
     const snapshot = s.project
-    await window.kadr.autosaveProject(snapshot, s.projectPath)
+    const path = s.projectPath
+    // Zustand updates replace the project; IPC snapshots it synchronously.
+    // The main process writes a separate recovery file with tmp + rename.
+    await window.kadr.autosaveProject(snapshot, path)
     lastSnapshot = snapshot
+    lastPath = path
   } catch (err) {
     logWarn('автосохранение', 'не удалось записать, повторю через 5 минут', err)
+  } finally {
+    saving = false
   }
 }
 
